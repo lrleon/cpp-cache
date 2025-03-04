@@ -343,30 +343,30 @@ class Cache
       _ttl_exp_time = exp_time;
     }
 
-    Data *compress()
-    {
-      cout << "Compressing data" << endl;
-      vector<char> serialized_data;
-      if constexpr (std::is_class_v<Data> &&
-                    requires(Data d) {{ d.serialize() } -> std::same_as<vector<char>>; })
-        serialized_data = this->data()->serialize();
-      else
-        {
-          TypeWrapper<Data> data_wrapper(*this->data());
-          serialized_data = data_wrapper.serialize();
-        }
-      Data *calc_data = this->data();
-      this->set_data(nullptr);
-      this->original_data_size() = serialized_data.size();
+    // Data *compress()
+    // {
+    //   cout << "Compressing data" << endl;
+    //   vector<char> serialized_data;
+    //   if constexpr (std::is_class_v<Data> &&
+    //                 requires(Data d) {{ d.serialize() } -> std::same_as<vector<char>>; })
+    //     serialized_data = this->data()->serialize();
+    //   else
+    //     {
+    //       TypeWrapper<Data> data_wrapper(*this->data());
+    //       serialized_data = data_wrapper.serialize();
+    //     }
+    //   Data *calc_data = this->data();
+    //   this->set_data(nullptr);
+    //   this->original_data_size() = serialized_data.size();
 
-      lz4_compress(serialized_data, this->compressed_data());
+    //   lz4_compress(serialized_data, this->compressed_data());
 
-      assert(this->compressed_data().size() > 0);
-      assert(this->data() == nullptr);
-      assert(this->original_data_size() > 0);
+    //   assert(this->compressed_data().size() > 0);
+    //   assert(this->data() == nullptr);
+    //   assert(this->original_data_size() > 0);
 
-      return calc_data;
-    }
+    //   return calc_data;
+    // }
   }; // end class CacheEntry
 
   struct CacheCmp
