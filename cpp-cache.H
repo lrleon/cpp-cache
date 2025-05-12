@@ -466,7 +466,12 @@ class Cache
     // Assumes that mutex mtx is locked
     pair<CacheEntry *, bool> contains_or_insert_in_hash_table(const Key &key)
     {
-      assert(hash_table.size() <= cache_size);
+      if(hash_table.size() > cache_size) {
+        cout  << "hash_table.size() > cache_size" << endl 
+              << "hash_table.size(): " << hash_table.size() << endl
+              << "cache_size: " << cache_size << endl;
+      }
+      assert(hash_table.size() <= cache_size);      
 
       const bool is_cache_full = hash_table.size() == cache_size;
 
