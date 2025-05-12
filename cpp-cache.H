@@ -62,7 +62,6 @@ class Cache
   FRIEND_TEST(SimpleFixture, basic);
   FRIEND_TEST(SimpleFixture, lru);
   FRIEND_TEST(SimpleFixture, touch);
-  FRIEND_TEST(SimpleFixture, compression);
   FRIEND_TEST(cache_entry, basic);
   FRIEND_TEST(cache_entry, key_copy_works);
   FRIEND_TEST(cache_entry, key_move_works);
@@ -693,7 +692,7 @@ class Cache
     pair<Data *, int8_t>
     retrieve_from_cache_or_compute(const Key &key, void *cookie = nullptr)
     {
-      CacheEntry entry(key);
+      //CacheEntry entry(key);
 
       // Search for the entry in the hash table
       pair<CacheEntry *, bool> entry_ptr;
