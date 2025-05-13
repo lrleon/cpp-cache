@@ -380,6 +380,9 @@ class Cache
     // removes from the hash table and lru list
     void remove_entry_from_hash_table(CacheEntry *cache_entry)
     {
+      cout << "removing entry from hash table, "
+            << "size: " << hash_table.size() << endl;            
+
       cache_entry->set_status(CacheEntry::Status::AVAILABLE);
       cache_entry->link_lru()->del();
 
