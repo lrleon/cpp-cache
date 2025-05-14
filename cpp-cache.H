@@ -475,7 +475,8 @@ class Cache
       }
       assert(hash_table.size() <= cache_size);      
 
-      const bool is_cache_full = hash_table.size() == cache_size;
+      // hash table size can be greater than cache size at some point
+      const bool is_cache_full = hash_table.size() >= cache_size;
 
       auto p = hash_table.contains_or_insert(CacheEntry(key));
 
