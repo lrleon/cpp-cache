@@ -514,7 +514,6 @@ TEST_F(TimeConsumingFixture, multithread_heavy_futures)
 
 TEST_F(TimeConsumingFixture, multithread_heavy_threads)
 {
-  using CacheEntry = Cache<int, int>::CacheEntry;
   for (int k = 0; k < 50; k++)
     {
       constexpr int N = 20;
@@ -540,7 +539,7 @@ TEST_F(TimeConsumingFixture, multithread_heavy_threads)
       for (auto &t: threads)
         t.join();
 
-      for (auto &res: results)
+      for (auto const &res: results)
         ASSERT_EQ(res.second, 1);
       // continue;
       ASSERT_EQ(cache.size(), 5);

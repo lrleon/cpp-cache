@@ -481,16 +481,21 @@ class Cache
       CacheEntry *cache_entry = p.first;
       if (const bool is_in_table = p.second)
         {
-          assert(cache_entry->status() != CacheEntry::Status::AVAILABLE);
+# ifdef DEBUG
+          {
+            scoped_lock entry_lock(cache_entry->mtx());
+            assert(cache_entry->status() == CacheEntry::Status::AVAILABLE);
+          }
+# endif
           do_mru(cache_entry); // That would prevent another thread to evict by LRU
           return p;
         }
 
-      // In tis point it is sure that the entry is not in the hash table and
-      // we are face to a cache miss
+      // At this point it is certain that the entry is not in the hash table, and
+      // we are faced with a cache miss
 
       if (is_cache_full)
-        { // cache is full, we need to evict the LRU entry
+        { // the cache is full, we need to evict the LRU entry
           CacheEntry *lru_entry = get_lru_entry();
           remove_entry_from_hash_table(lru_entry);
           assert(cache_size == hash_table.size());
@@ -726,13 +731,14 @@ class Cache
         if (is_in_table) // possible cache hit
           {
             if (has_entry_ttl_expired(cache_entry, high_resolution_clock::now()))
-              // in this case, the entry is not valid anymore and we'll
-              // solve the situation as a cache miss below (outside of this critical section)
-              remove_entry_from_hash_table(cache_entry);
+              {
+                cache_entry->set_status(CacheEntry::Status::AVAILABLE);
+                cache_entry->ad_hoc_code() = 0;
+              }
             else
               {
                 // do_mru(cache_entry); // TODO: remove this comment
-                mtx.unlock(); // leave temporally cache critical section
+                mtx.unlock(); // leave temporally the cache critical section
 
                 { // ******** Cache entry critical section ********
                   unique_lock entry_lock(cache_entry->mtx());
@@ -762,6 +768,7 @@ class Cache
       //    remove entry_ptr? SOLVED!!! because entry_ptr is inside a protected block
       // 2- if the entry is not in the hash table, it is possible that another thread
       //    has already inserted it and is calculating the data.
+
       auto * data_ptr = resolve_cache_miss(cache_entry, time_now, cookie);
 
       return {data_ptr, cache_entry->ad_hoc_code()};
