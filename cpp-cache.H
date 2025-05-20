@@ -465,16 +465,10 @@ class Cache
     }
 
   private:
+
     // Assumes that mutex mtx is locked
     pair<CacheEntry*, bool> contains_or_insert_in_hash_table(const Key &key)
     {
-      if (hash_table.size() > cache_size)
-        {
-          cout << "hash_table.size() > cache_size" << endl
-            << "hash_table.size(): " << hash_table.size() << endl
-            << "cache_size: " << cache_size << endl;
-        }
-
       assert(hash_table.size() <= cache_size);
 
       // hash table size can be greater than cache size at some point
@@ -490,9 +484,11 @@ class Cache
           return p;
         }
 
+      // In tis point it is sure that the entry is not in the hash table and
+      // we are face to a cache miss
+
       if (is_cache_full)
-        {
-          // DANGEROUS ZONE:
+        { // cache is full, we need to evict the LRU entry
           CacheEntry *lru_entry = get_lru_entry();
           remove_entry_from_hash_table(lru_entry);
           assert(cache_size == hash_table.size());
@@ -719,7 +715,8 @@ class Cache
       // Search for the entry in the hash table
 
       const auto time_now = high_resolution_clock::now();
-      { // ****** Cache critical section ********
+
+      { // ************* Cache critical section **************
         scoped_lock lock(mtx);
         pair<CacheEntry*, bool> entry_ptr = contains_or_insert_in_hash_table(key);
         is_in_table = entry_ptr.second;
@@ -729,7 +726,7 @@ class Cache
           {
             if (has_entry_ttl_expired(cache_entry, high_resolution_clock::now()))
               // in this case, the entry is not valid anymore and we'll
-              // // solve the situation as a cache miss
+              // solve the situation as a cache miss below (outside of this critical section)
               remove_entry_from_hash_table(cache_entry);
             else
               {
@@ -752,7 +749,7 @@ class Cache
                 return {cache_entry->data_ptr(), cache_entry->ad_hoc_code()};
               }
           }
-        // END ****** Cache critical section ********
+        // END ************* Cache critical section **************
       }
 
       // This assertion should always pass because contains_or_insert_in_hash_table()
