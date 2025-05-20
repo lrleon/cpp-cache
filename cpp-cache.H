@@ -640,7 +640,8 @@ class Cache
         case CacheEntry::Status::CALCULATING:
           {
             // Result is not ready yet, wait for it
-            cache_entry->waiting_cv().wait(entry_lock, [cache_entry]
+            cache_entry->waiting_cv().
+            wait(entry_lock, [cache_entry]
             {
               return cache_entry->status() != CacheEntry::Status::CALCULATING;
             });
@@ -728,14 +729,17 @@ class Cache
             else
               {
                 do_mru(cache_entry);
-                mtx.unlock();
-                cache_entry->waiting_cv().
-                  wait(cache_entry->mtx(),
-                       [cache_entry]
-                       {
-                         return cache_entry->status() != CacheEntry::Status::CALCULATING;
-                       });
-                mtx.lock();
+                mtx.unlock(); // leave temporally cache critical section
+
+                { // ******** Cache entry critical section ********
+                  unique_lock entry_lock(cache_entry->mtx());
+                  cache_entry->waiting_cv().wait(entry_lock, [cache_entry]
+                         {
+                           return cache_entry->status() != CacheEntry::Status::CALCULATING;
+                         });
+                }
+
+                mtx.lock(); // re-enter cache critical section
 
                 assert(cache_entry->status() != CacheEntry::Status::CALCULATING and
                        cache_entry->status() != CacheEntry::Status::AVAILABLE);
@@ -748,14 +752,14 @@ class Cache
 
       // This assertion should always pass because contains_or_insert_in_hash_table()
       // should have returned a pointer to the entry in the hash table
-      assert(cache_entry != nullptr, "cache_entry is null");
+      assert(cache_entry != nullptr);
 
       // DANGEROUS ZONE:
       // 1- if another retrieve_from_cache_or_compute is called here: would be possible
       //    remove entry_ptr? SOLVED!!! because entry_ptr is inside a protected block
       // 2- if the entry is not in the hash table, it is possible that another thread
       //    has already inserted it and is calculating the data.
-      auto data_ptr = resolve_cache_miss(cache_entry, time_now, cookie);
+      CacheEntry * data_ptr = resolve_cache_miss(cache_entry, time_now, cookie);
 
       return {data_ptr, cache_entry->ad_hoc_code()};
     }
