@@ -759,7 +759,7 @@ class Cache
       //    remove entry_ptr? SOLVED!!! because entry_ptr is inside a protected block
       // 2- if the entry is not in the hash table, it is possible that another thread
       //    has already inserted it and is calculating the data.
-      CacheEntry * data_ptr = resolve_cache_miss(cache_entry, time_now, cookie);
+      auto * data_ptr = resolve_cache_miss(cache_entry, time_now, cookie);
 
       return {data_ptr, cache_entry->ad_hoc_code()};
     }
