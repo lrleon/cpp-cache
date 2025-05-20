@@ -606,7 +606,7 @@ class Cache
                              void *cookie)
     {
       Data *result_ptr = nullptr;
-      unique_lock entry_lock(cache_entry->mtx()); // Entry critical section
+      unique_lock entry_lock(cache_entry->mtx()); // Entry cache entry critical section
 
       switch (cache_entry->status())
         {
@@ -626,7 +626,8 @@ class Cache
 
           result_ptr = cache_entry->data_ptr();
 
-          entry_lock.unlock(); // leave temporally entry critical section
+          entry_lock.unlock(); // leave temporally entry critical section because we need
+                               // to enter the cache critical section to update the lru list
           { // ******** Cache critical section ********
             scoped_lock lock(mtx);
             do_mru(cache_entry);
@@ -639,13 +640,17 @@ class Cache
 
         case CacheEntry::Status::CALCULATING:
           {
-            // Result is not ready yet, wait for it
+            // Result is not ready yet, wait for its completion
             cache_entry->waiting_cv().
             wait(entry_lock, [cache_entry]
             {
               return cache_entry->status() != CacheEntry::Status::CALCULATING;
             });
             result_ptr = cache_entry->data_ptr();
+
+            cache_entry->set_ttl_exp_time(time_now +
+              cache_entry->status() == CacheEntry::Status::READY ?
+              positive_ttl : negative_ttl);
           }
           break;
 
@@ -702,6 +707,7 @@ class Cache
     // }
 
   public:
+
     // computed/retrieved data, ad hoc status set by the miss handler
     pair<Data*, int8_t>
     retrieve_from_cache_or_compute(const Key &key, void *cookie = nullptr)
@@ -721,11 +727,9 @@ class Cache
         if (is_in_table) // possible cache hit
           {
             if (has_entry_ttl_expired(cache_entry, high_resolution_clock::now()))
-              {
-                // Since the entrance is already away, it is not worth it
-                // Remove it logically. Update the TTL and do it Mru
-                remove_entry_from_hash_table(cache_entry);
-              }
+              // in this case, the entry is not valid anymore and we'll
+              // // solve the situation as a cache miss
+              remove_entry_from_hash_table(cache_entry);
             else
               {
                 do_mru(cache_entry);
@@ -751,7 +755,7 @@ class Cache
       }
 
       // This assertion should always pass because contains_or_insert_in_hash_table()
-      // should have returned a pointer to the entry in the hash table
+      // should have returned a valid pointer to the entry in the hash table
       assert(cache_entry != nullptr);
 
       // DANGEROUS ZONE:
