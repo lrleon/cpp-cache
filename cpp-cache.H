@@ -380,9 +380,6 @@ class Cache
     // removes from the hash table and lru list
     void remove_entry_from_hash_table(CacheEntry *cache_entry)
     {
-      cout << "removing entry from hash table, "
-        << "size: " << hash_table.size() << endl;
-
       cache_entry->set_status(CacheEntry::Status::AVAILABLE);
       cache_entry->link_lru()->del();
 
@@ -480,6 +477,7 @@ class Cache
       CacheEntry *cache_entry = p.first;
       if (const bool is_in_table = p.second)
         {
+          assert(cache_entry->status() != CacheEntry::Status::AVAILABLE);
           do_mru(cache_entry); // That would prevent another thread to evict by LRU
           return p;
         }
@@ -709,7 +707,6 @@ class Cache
     pair<Data*, int8_t>
     retrieve_from_cache_or_compute(const Key &key, void *cookie = nullptr)
     {
-      bool is_in_table = false;
       CacheEntry *cache_entry = nullptr;
 
       // Search for the entry in the hash table
@@ -719,7 +716,7 @@ class Cache
       { // ************* Cache critical section **************
         scoped_lock lock(mtx);
         pair<CacheEntry*, bool> entry_ptr = contains_or_insert_in_hash_table(key);
-        is_in_table = entry_ptr.second;
+        const bool is_in_table = entry_ptr.second;
         cache_entry = static_cast<CacheEntry*>(entry_ptr.first);
 
         if (is_in_table) // possible cache hit
@@ -730,7 +727,7 @@ class Cache
               remove_entry_from_hash_table(cache_entry);
             else
               {
-                do_mru(cache_entry);
+                // do_mru(cache_entry); // TODO: remove this comment
                 mtx.unlock(); // leave temporally cache critical section
 
                 { // ******** Cache entry critical section ********
