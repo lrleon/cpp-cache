@@ -492,6 +492,7 @@ class Cache
 
       if (is_cache_full)
         {
+          // DANGEROUS ZONE:
           CacheEntry *lru_entry = get_lru_entry();
           remove_entry_from_hash_table(lru_entry);
           assert(cache_size == hash_table.size());
