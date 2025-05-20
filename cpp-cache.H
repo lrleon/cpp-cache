@@ -719,14 +719,15 @@ class Cache
             mtx.unlock(); // leave temporally the cache critical section
 
             {     // ************* ENTRY critical section
-              entry_lock(cache_entry->mtx());
+              entry_lock = unique_lock(cache_entry->mtx());
 
               if (has_entry_ttl_expired(cache_entry, high_resolution_clock::now()))
                 {
+                  assert(cache_entry->status() != CacheEntry::Status::AVAILABLE);
                   cache_entry->set_status(CacheEntry::Status::AVAILABLE);
                   cache_entry->ad_hoc_code() = 0;
                   mtx.lock();
-                  assert(cache_entry->link_lru()->is_empty());
+                  assert(not cache_entry->link_lru()->is_empty());
                 }
               else
                 {
@@ -748,7 +749,7 @@ class Cache
             }
           }
         else
-          entry_lock(cache_entry->mtx());
+          entry_lock = unique_lock(cache_entry->mtx());
       }
 
       // This assertion should always pass because contains_or_insert_in_hash_table()

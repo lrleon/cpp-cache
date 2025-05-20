@@ -387,7 +387,8 @@ TEST_F(TimeConsumingFixture, calculating_status_while_computing)
   auto future =
     std::async(std::launch::async, [this, &cache_entry]()
     {
-      return cache.resolve_cache_miss(cache_entry,
+      unique_lock entry_lock(cache_entry->mtx());
+      return cache.resolve_cache_miss(entry_lock, cache_entry,
                                       high_resolution_clock::now(), nullptr);
     });
 
