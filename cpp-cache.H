@@ -649,8 +649,8 @@ class Cache
             result_ptr = cache_entry->data_ptr();
 
             cache_entry->set_ttl_exp_time(time_now +
-              cache_entry->status() == CacheEntry::Status::READY ?
-              positive_ttl : negative_ttl);
+              (cache_entry->status() == CacheEntry::Status::READY ?
+              positive_ttl : negative_ttl));
           }
           break;
 
