@@ -606,7 +606,7 @@ class Cache
                              void *cookie)
     {
       Data *result_ptr = nullptr;
-      unique_lock entry_lock(cache_entry->mtx());
+      unique_lock entry_lock(cache_entry->mtx()); // Entry critical section
 
       switch (cache_entry->status())
         {
@@ -626,12 +626,12 @@ class Cache
 
           result_ptr = cache_entry->data_ptr();
 
-          entry_lock.unlock();
-          {
+          entry_lock.unlock(); // leave temporally entry critical section
+          { // ******** Cache critical section ********
             scoped_lock lock(mtx);
             do_mru(cache_entry);
-          }
-          entry_lock.lock();
+          } // ******** END Cache critical section ********
+          entry_lock.lock(); // re-enter entry critical section
 
           cache_entry->waiting_cv().notify_all(); // wake up waiting threads associated with the key
 
@@ -639,6 +639,7 @@ class Cache
 
         case CacheEntry::Status::CALCULATING:
           {
+            // Result is not ready yet, wait for it
             cache_entry->waiting_cv().wait(entry_lock, [cache_entry]
             {
               return cache_entry->status() != CacheEntry::Status::CALCULATING;
@@ -742,6 +743,7 @@ class Cache
                 return {cache_entry->data_ptr(), cache_entry->ad_hoc_code()};
               }
           }
+        // END ****** Cache critical section ********
       }
 
       // This assertion should always pass because contains_or_insert_in_hash_table()
