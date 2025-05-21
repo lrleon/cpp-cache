@@ -157,7 +157,8 @@ TEST_F(SimpleFixture, lru)
   ASSERT_NE(cache.get_lru_entry()->key(), 90);
 
   // remove lru entry
-  cache.remove_entry_from_hash_table(cache.get_lru_entry());
+  unique_lock<mutex> entry_lock(cache.get_lru_entry()->mtx());
+  cache.remove_entry_from_hash_table(entry_lock, cache.get_lru_entry());
 
   ASSERT_EQ(cache.size(), 1);
 

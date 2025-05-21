@@ -378,10 +378,10 @@ class Cache
     }
 
     // removes from the hash table and lru list
-    void remove_entry_from_hash_table(CacheEntry *cache_entry)
+    void remove_entry_from_hash_table(unique_lock<mutex> & taken_lock,
+                                      CacheEntry *cache_entry)
     {
-      unique_lock<mutex> lock(cache_entry->mtx());
-      cache_entry->waiting_cv().wait(lock, [cache_entry]
+      cache_entry->waiting_cv().wait(taken_lock, [cache_entry]
       {
         return cache_entry->status() != CacheEntry::Status::CALCULATING;
       });
@@ -506,7 +506,8 @@ class Cache
         {
           // we need to evict the LRU entry
           CacheEntry *lru_entry = get_lru_entry();
-          remove_entry_from_hash_table(lru_entry);
+          unique_lock<mutex> entry_lock(lru_entry->mtx());
+          remove_entry_from_hash_table(entry_lock, lru_entry);
           assert(cache_size == hash_table.size());
         }
 
@@ -550,11 +551,11 @@ class Cache
       if (cache_entry == nullptr)
         return false;
 
-      scoped_lock entry_lock(cache_entry->mtx());
+      unique_lock<mutex> entry_lock(cache_entry->mtx());
       if (not has_entry_ttl_expired(cache_entry, high_resolution_clock::now()))
         return true;
 
-      remove_entry_from_hash_table(cache_entry);
+      remove_entry_from_hash_table(entry_lock, cache_entry);
       return false;
     }
 
@@ -781,7 +782,7 @@ class Cache
             << "CacheEntry is still in CALCULATING status after 5 seconds";
         }
 
-      remove_entry_from_hash_table(cache_entry);
+      remove_entry_from_hash_table(entry_lock, cache_entry);
     }
 
     const size_t& capacity() const { return cache_size; }
