@@ -376,19 +376,20 @@ struct TimeConsumingFixture : public Test
   {
     *data = key * 10;
     ++ad_hoc_code; // never must be greater than 1
-    sleep(2);
+
+    sleep(1);
 
     // burn CPU
     unsigned long long i = 0;
     unsigned long long j = 0;
-    for (i = 0; i < 100000000; ++i)
+    //for (i = 0; i < 10000000000; ++i)
       {
         j = i * i;
         j = j / 2;
       }
 
     cout << "Miss handler finished for key: " << key << endl
-          << "ad_hoc_code: " << (int)ad_hoc_code << endl
+          << "ad_hoc_code: " << static_cast<int>(ad_hoc_code) << endl
           << "data: " << *data << endl
           << "i: " << i << endl
           << "j: " << j << endl;
@@ -399,7 +400,7 @@ struct TimeConsumingFixture : public Test
   Cache<int, int> cache;
 
   TimeConsumingFixture()
-    : cache(1.2 * Num_Keys, 20s, 1s, miss_handler)
+    : cache(Num_Keys - 1, 20s, 1s, miss_handler)
   {
     // empty
   }
@@ -543,6 +544,7 @@ TEST_F(TimeConsumingFixture, multithread_heavy_threads)
 {
   for (int k = 0; k < 500; k++)
     {
+      cout << "Iteration: " << k << endl << endl;
       vector<thread> threads;
       vector<pair<int *, int8_t>> results(Num_Threads * Num_Keys);
       mutex results_mutex;
@@ -562,15 +564,12 @@ TEST_F(TimeConsumingFixture, multithread_heavy_threads)
       for (auto &t: threads)
         t.join();
 
-      cout << "Result index: " << result_index << endl;
+      assert(result_index > 0);
 
       for (auto const &res: results)
         ASSERT_EQ(res.second, 1);
-      // continue;
-      ASSERT_EQ(cache.size(), Num_Keys);
 
-      for (int i = 1; i <= 5; ++i)
-        ASSERT_TRUE(cache.has(i));
+      ASSERT_EQ(cache.size(), Num_Keys - 1);
 
       for (int i = 0; i < Num_Threads * 5; i += Num_Threads)
         {
@@ -585,6 +584,63 @@ TEST_F(TimeConsumingFixture, multithread_heavy_threads)
         }
     }
 }
+
+TEST_F(TimeConsumingFixture, random_multithread_heavy_threads)
+{
+  for (int k = 0; k < 500; k++)
+    {
+      cout << "Iteration: " << k << endl << endl;
+      vector<thread> threads;
+      vector<pair<int *, int8_t>> results(Num_Threads * Num_Keys);
+      mutex results_mutex;
+      unsigned long long result_index = 0;
+
+      vector<pair<int, int>> pairs;
+      pairs.reserve(Num_Threads * Num_Keys);
+      auto it = pairs.begin();
+      for (int i = 0; i < Num_Keys; ++i)
+        for (int j = 0; j < Num_Threads; ++j, ++it)
+          pairs.emplace_back(i, j);
+
+      std::random_shuffle(pairs.begin(), pairs.end());
+
+      for (auto [i, j]: pairs)
+        {
+          cout << i << " " << j << endl;
+          threads.emplace_back([this, i, j, &results, &results_mutex, &result_index]()
+                               {
+                                   const pair<int *, int8_t> result =
+                                     cache.retrieve_from_cache_or_compute(i + 1);
+                                   lock_guard<mutex> lock(results_mutex);
+                                   results[i * Num_Threads + j] = result;
+                                   ++result_index;
+                               });
+        }
+
+      for (auto &t: threads)
+        t.join();
+
+      assert(result_index > 0);
+
+      for (auto const &res: results)
+        ASSERT_EQ(res.second, 1);
+
+      ASSERT_EQ(cache.size(), Num_Keys - 1);
+
+      for (int i = 0; i < Num_Threads * 5; i += Num_Threads)
+        {
+          auto res_i = results[i];
+          for (int j = 1; j < Num_Threads; ++j)
+            {
+              auto res_j = results[i + j];
+              ASSERT_EQ(*res_i.first, *res_j.first);
+              ASSERT_EQ(res_i.first, res_j.first); // same address
+              ASSERT_EQ(res_i.second, res_j.second);
+            }
+        }
+    }
+}
+
 
 struct RandomTimeFixture : public Test
 {

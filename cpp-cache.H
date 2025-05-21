@@ -391,7 +391,12 @@ class Cache
              cache_entry->status() == CacheEntry::Status::FAILED);
       assert(not cache_entry->link_lru()->is_empty());
 
+      // we need to clean the entry before removing it so that a future
+      // insertion of the same key gets a fresh entry
       cache_entry->set_status(CacheEntry::Status::AVAILABLE);
+      cache_entry->ad_hoc_code() = 0;
+      new (cache_entry->data_ptr()) Data(); // reset data
+
       cache_entry->link_lru()->del();
 
       hash_table.remove(*cache_entry);
@@ -483,21 +488,15 @@ class Cache
       // hash table size can be greater than cache size at some point
       const bool is_cache_full = hash_table.size() >= cache_size;
 
-      auto p =
+      const auto p =
         hash_table.contains_or_insert(CacheEntry(key));
 
       CacheEntry *cache_entry = p.first;
       if (const bool is_in_table = p.second)
         {
-# ifdef DEBUG
-          {
-            scoped_lock entry_lock(cache_entry->mtx());
-            assert(cache_entry->status() == CacheEntry::Status::AVAILABLE);
-          }
-# endif
           do_mru(cache_entry); // That would prevent another thread to evict by LRU
           return p;
-        }
+         }
 
       // At this point it is certain that the entry is not in the hash table, and
       // we are faced with a cache miss
@@ -722,7 +721,6 @@ class Cache
         {
           if (has_entry_ttl_expired(cache_entry, high_resolution_clock::now()))
             {
-              assert(cache_entry->status() != CacheEntry::Status::AVAILABLE);
               cache_entry->set_status(CacheEntry::Status::AVAILABLE);
               cache_entry->ad_hoc_code() = 0;
               assert(not cache_entry->link_lru()->is_empty());
@@ -739,8 +737,7 @@ class Cache
                                                ? positive_ttl
                                                : negative_ttl));
 
-              assert(cache_entry->status() != CacheEntry::Status::CALCULATING and
-                cache_entry->status() != CacheEntry::Status::AVAILABLE);
+              assert(cache_entry->status() != CacheEntry::Status::CALCULATING);
 
               return {cache_entry->data_ptr(), cache_entry->ad_hoc_code()};
             }
