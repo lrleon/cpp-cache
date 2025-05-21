@@ -361,19 +361,37 @@ TEST_F(SimpleFixture, iterator)
 
 struct TimeConsumingFixture : public Test
 {
+  static constexpr int Num_Threads = 50;
+  static constexpr int Num_Keys = 50;
   static bool miss_handler(const int &key, int *data,
                            int8_t &ad_hoc_code, void *)
   {
     *data = key * 10;
     ++ad_hoc_code; // never must be greater than 1
     sleep(2);
+
+    // burn CPU
+    unsigned long long i = 0;
+    unsigned long long j = 0;
+    for (i = 0; i < 100000000; ++i)
+      {
+        j = i * i;
+        j = j / 2;
+      }
+
+    cout << "Miss handler finished for key: " << key << endl
+          << "ad_hoc_code: " << (int)ad_hoc_code << endl
+          << "data: " << *data << endl
+          << "i: " << i << endl
+          << "j: " << j << endl;
+
     return true;
   }
 
   Cache<int, int> cache;
 
   TimeConsumingFixture()
-    : cache(5, 20s, 1s, miss_handler)
+    : cache(1.2 * Num_Keys, 20s, 1s, miss_handler)
   {
     // empty
   }
@@ -515,43 +533,41 @@ TEST_F(TimeConsumingFixture, multithread_heavy_futures)
 
 TEST_F(TimeConsumingFixture, multithread_heavy_threads)
 {
-  for (int k = 0; k < 50; k++)
+  for (int k = 0; k < 500; k++)
     {
-      constexpr int N = 20;
       vector<thread> threads;
-      vector<pair<int *, int8_t>> results(N * 5);
+      vector<pair<int *, int8_t>> results(Num_Threads * Num_Keys);
       mutex results_mutex;
-      int result_index = 0;
+      unsigned long long result_index = 0;
 
-      for (int i = 0; i < 5; ++i)
-        for (int j = 0; j < N; ++j)
-          {
+      for (int i = 0; i < Num_Keys; ++i)
+        for (int j = 0; j < Num_Threads; ++j)
             threads.emplace_back([this, i, j, &results, &results_mutex, &result_index]()
                                  {
-                                   pair<int *, int8_t> result =
-                                     cache.retrieve_from_cache_or_compute(i + 1);
-                                   {
+                                     const pair<int *, int8_t> result =
+                                       cache.retrieve_from_cache_or_compute(i + 1);
                                      lock_guard<mutex> lock(results_mutex);
-                                     results[i * N + j] = result;
-                                   }
+                                     results[i * Num_Threads + j] = result;
+                                     ++result_index;
                                  });
-          }
 
       for (auto &t: threads)
         t.join();
 
+      cout << "Result index: " << result_index << endl;
+
       for (auto const &res: results)
         ASSERT_EQ(res.second, 1);
       // continue;
-      ASSERT_EQ(cache.size(), 5);
+      ASSERT_EQ(cache.size(), Num_Keys);
 
       for (int i = 1; i <= 5; ++i)
         ASSERT_TRUE(cache.has(i));
 
-      for (int i = 0; i < N * 5; i += N)
+      for (int i = 0; i < Num_Threads * 5; i += Num_Threads)
         {
           auto res_i = results[i];
-          for (int j = 1; j < N; ++j)
+          for (int j = 1; j < Num_Threads; ++j)
             {
               auto res_j = results[i + j];
               ASSERT_EQ(*res_i.first, *res_j.first);
