@@ -699,6 +699,7 @@ class Cache
     // }
 
   public:
+
     // computed/retrieved data, ad hoc status set by the miss handler
     pair<Data *, int8_t>
     retrieve_from_cache_or_compute(const Key &key, void *cookie = nullptr)
@@ -707,26 +708,26 @@ class Cache
       const auto time_now = high_resolution_clock::now();
 
       unique_lock<mutex> entry_lock; // lock for the entry
+      pair<CacheEntry *, bool> entry_ptr;
 
-      { // *************  GLOBAL CACHE CRITICAL SECTION **************
+      {
+        // *************  GLOBAL CACHE CRITICAL SECTION **************
         scoped_lock lock(mtx);
-        pair<CacheEntry *, bool> entry_ptr = contains_or_insert_in_hash_table(key);
+        entry_ptr = contains_or_insert_in_hash_table(key);
+      }
+
         const bool is_in_table = entry_ptr.second;
         cache_entry = static_cast<CacheEntry *>(entry_ptr.first);
 
         if (is_in_table) // possible cache hit
           {
-            mtx.unlock(); // leave temporally the cache critical section
-
-            {     // ************* ENTRY critical section
-              entry_lock = unique_lock(cache_entry->mtx());
+            entry_lock = unique_lock(cache_entry->mtx());
 
               if (has_entry_ttl_expired(cache_entry, high_resolution_clock::now()))
                 {
                   assert(cache_entry->status() != CacheEntry::Status::AVAILABLE);
                   cache_entry->set_status(CacheEntry::Status::AVAILABLE);
                   cache_entry->ad_hoc_code() = 0;
-                  mtx.lock();
                   assert(not cache_entry->link_lru()->is_empty());
                 }
               else
@@ -747,10 +748,8 @@ class Cache
                   return {cache_entry->data_ptr(), cache_entry->ad_hoc_code()};
                 }
             }
-          }
         else
           entry_lock = unique_lock(cache_entry->mtx());
-      }
 
       // This assertion should always pass because contains_or_insert_in_hash_table()
       // should have returned a valid pointer to the entry in the hash table
