@@ -114,6 +114,7 @@ struct SimpleFixture : public Test
     // empty
   }
 };
+
 TEST_F(SimpleFixture, basic)
 {
   ASSERT_EQ(cache.capacity(), 5);
@@ -143,6 +144,7 @@ TEST_F(SimpleFixture, basic)
   // check expired key was removed from the cache
   ASSERT_EQ(cache.size(), 0);
 }
+
 TEST_F(SimpleFixture, lru)
 {
   cache.insert(1, 10);
@@ -162,6 +164,7 @@ TEST_F(SimpleFixture, lru)
   // check lru entry
   ASSERT_EQ(cache.get_lru_entry()->key(), 2);
 }
+
 TEST_F(SimpleFixture, insert_with_has_and_touch)
 {
   ASSERT_TRUE(cache.insert(1, 10))
@@ -230,6 +233,7 @@ TEST_F(SimpleFixture, touch)
   // touch unknown key
   ASSERT_FALSE(cache.touch(90));
 }
+
 TEST_F(SimpleFixture, cache_is_full)
 {
   cache.insert(1, 10);
@@ -267,6 +271,7 @@ TEST_F(SimpleFixture, cache_is_full)
 
   ASSERT_FALSE(cache.has(1));
 }
+
 TEST_F(SimpleFixture, remove)
 {
   cache.insert(1, 10);
@@ -281,6 +286,7 @@ TEST_F(SimpleFixture, remove)
   ASSERT_EQ(cache.size(), 1);
   ASSERT_FALSE(cache.has(1));
 }
+
 TEST_F(SimpleFixture, retrieve_or_compute_basic)
 {
   auto res = cache.retrieve_from_cache_or_compute(1);
@@ -754,6 +760,7 @@ struct CookieHandler : public Test
     // empty
   }
 };
+
 TEST_F(CookieHandler, cookie)
 {
   Parameters params = {10, 20};
