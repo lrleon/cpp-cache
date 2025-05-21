@@ -742,12 +742,6 @@ class Cache
       // should have returned a valid pointer to the entry in the hash table
       assert(cache_entry != nullptr);
 
-      // DANGEROUS ZONE:
-      // 1- if another retrieve_from_cache_or_compute is called here: would be possible
-      //    remove entry_ptr? SOLVED!!! because entry_ptr is inside a protected block
-      // 2- if the entry is not in the hash table, it is possible that another thread
-      //    has already inserted it and is calculating the data.
-
       auto *data_ptr = resolve_cache_miss(entry_lock, cache_entry, time_now, cookie);
 
       return {data_ptr, cache_entry->ad_hoc_code()};
@@ -761,8 +755,26 @@ class Cache
 
       auto *cache_entry = static_cast<CacheEntry*>(hash_table.search(entry));
 
-      if (cache_entry != nullptr)
-        remove_entry_from_hash_table(cache_entry);
+      if (cache_entry == nullptr)
+        return;
+
+      unique_lock<mutex> entry_lock(cache_entry->mtx());
+
+      if (cache_entry->status() == CacheEntry::Status::CALCULATING)
+        {
+          cache_entry->waiting_cv().
+            wait_for(entry_lock,
+                     std::chrono::seconds(5),
+                     [cache_entry]
+                     {
+                       return cache_entry->status() != CacheEntry::Status::CALCULATING;
+                     });
+
+          ah_runtime_error_if(cache_entry->status() == CacheEntry::Status::CALCULATING)
+            << "CacheEntry is still in CALCULATING status after 5 seconds";
+        }
+
+      remove_entry_from_hash_table(cache_entry);
     }
 
     const size_t& capacity() const { return cache_size; }
