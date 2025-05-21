@@ -8,8 +8,10 @@
 # include <future>
 # include <thread>
 # include "cpp-cache.H"
+# include <numeric>
 
 # include <tpl_dynMapTree.H>
+#include <random>
 
 using namespace std;
 using namespace testing;
@@ -599,16 +601,22 @@ TEST_F(TimeConsumingFixture, multithread_heavy_threads_full)
       mutex results_mutex;
       unsigned long long result_index = 0;
 
-      for (int i = 0; i < Num_Keys + 1; ++i)
+      vector<int> indices(Num_Keys + 1);
+      iota(indices.begin(), indices.end(), 0);
+      random_device rd;
+      mt19937 g(rd());
+      shuffle(indices.begin(), indices.end(), g);
+
+      for (int i : indices)
         for (int j = 0; j < Num_Threads; ++j)
-            threads.emplace_back([this, i, j, &results, &results_mutex, &result_index]()
-                                 {
-                                     const pair<int *, int8_t> result =
-                                       cache.retrieve_from_cache_or_compute(i + 1);
-                                     lock_guard<mutex> lock(results_mutex);
-                                     results[i * Num_Threads + j] = result;
-                                     ++result_index;
-                                 });
+        threads.emplace_back([this, i, j, &results, &results_mutex, &result_index]()
+                 {
+                 const pair<int *, int8_t> result =
+                   cache.retrieve_from_cache_or_compute(i + 1);
+                 lock_guard<mutex> lock(results_mutex);
+                 results[i * Num_Threads + j] = result;
+                 ++result_index;
+                 });
 
       for (auto &t: threads)
         t.join();
