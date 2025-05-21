@@ -506,8 +506,13 @@ class Cache
           // we need to evict the LRU entry
           CacheEntry *lru_entry = get_lru_entry();
           unique_lock<mutex> entry_lock(lru_entry->mtx());
+
+          if (lru_entry->status() == CacheEntry::Status::CALCULATING)
+            return {nullptr, true};
+
           remove_entry_from_hash_table(entry_lock, lru_entry);
           assert(cache_size == hash_table.size());
+          cout << "**** Evicted entry " << (int) lru_entry->key() << endl;
         }
 
       insert_entry_to_lru_list(cache_entry);
@@ -721,6 +726,7 @@ class Cache
         {
           if (has_entry_ttl_expired(cache_entry, high_resolution_clock::now()))
             {
+              assert(cache_entry->status() != CacheEntry::Status::AVAILABLE);
               cache_entry->set_status(CacheEntry::Status::AVAILABLE);
               cache_entry->ad_hoc_code() = 0;
               assert(not cache_entry->link_lru()->is_empty());
@@ -737,7 +743,8 @@ class Cache
                                                ? positive_ttl
                                                : negative_ttl));
 
-              assert(cache_entry->status() != CacheEntry::Status::CALCULATING);
+              assert(cache_entry->status() != CacheEntry::Status::CALCULATING and
+                cache_entry->status() != CacheEntry::Status::AVAILABLE);
 
               return {cache_entry->data_ptr(), cache_entry->ad_hoc_code()};
             }
