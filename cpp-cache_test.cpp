@@ -321,6 +321,7 @@ TEST_F(SimpleFixture, retrieve_or_compute_expired)
   ASSERT_EQ(*res.first, 10);
   ASSERT_EQ(res.second, 1);
 }
+
 TEST_F(SimpleFixture, iterator)
 {
   DynMapTree<int, int> key_value_map = {{1, 10},
@@ -416,7 +417,7 @@ TEST_F(TimeConsumingFixture, calculating_status_while_computing)
   ASSERT_EQ(cache_entry->status(), CacheEntry::Status::CALCULATING);
 
   // wait miss handler to finish
-  int *res = future.get();
+  const int *res = future.get();
 
   cout << CacheEntry::status_to_string(cache_entry->status()) << endl;
   ASSERT_EQ(cache_entry->status(), CacheEntry::Status::READY);
