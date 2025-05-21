@@ -380,8 +380,15 @@ class Cache
     // removes from the hash table and lru list
     void remove_entry_from_hash_table(CacheEntry *cache_entry)
     {
+      unique_lock<mutex> lock(cache_entry->mtx());
+      cache_entry->waiting_cv().wait(lock, [cache_entry]
+      {
+        return cache_entry->status() != CacheEntry::Status::CALCULATING;
+      });
+
       assert(cache_entry != nullptr);
-      assert(cache_entry->status() != CacheEntry::Status::AVAILABLE);
+      assert(cache_entry->status() == CacheEntry::Status::READY or
+             cache_entry->status() == CacheEntry::Status::FAILED);
       assert(not cache_entry->link_lru()->is_empty());
 
       cache_entry->set_status(CacheEntry::Status::AVAILABLE);
