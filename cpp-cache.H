@@ -477,59 +477,22 @@ class Cache
       assert(len > 1);
     }
 
-  private:
-    // Takes the global mutex
-    // Search key in the hash table and if not found, insert it and second is false;
-    // Otherwise, second is true (key is already in the hash table).
-    pair<CacheEntry*, bool> thread_safe_contains_or_insert_in_hash_table(const Key &key)
-    {
-      scoped_lock lock(mtx);
-
-      assert(hash_table.size() <= cache_size);
-
-      CacheEntry *cache_entry = static_cast<CacheEntry*>(hash_table.search(key));
-      if (const bool is_in_table = cache_entry != nullptr)
-        {
-          do_mru(cache_entry); // That would prevent another thread to evict by LRU
-          return make_pair(cache_entry, true);
-        }
-
-      if (const bool is_cache_full = hash_table.size() == cache_size)
-        {
-          // we need to evict the LRU entry
-          CacheEntry *lru_entry = get_lru_entry();
-          unique_lock<mutex> entry_lock(lru_entry->mtx());
-
-          ah_runtime_error_if(lru_entry->status() == CacheEntry::Status::CALCULATING)
-            << "CacheEntry is being calculated, cannot evict it";
-
-          assert(hash_table.size() == cache_size);
-          remove_entry_from_hash_table(entry_lock, lru_entry);
-          assert(hash_table.size() == cache_size - 1);
-          cout << "**** Evicted entry " << (int) lru_entry->key() << endl;
-        }
-
-      // key is was not found in the cache (it was inserted by contains_or_insert())
-      cache_entry = hash_table.insert(CacheEntry(key));
-      insert_entry_to_lru_list(cache_entry); // <-- this does cache entry the MRU entry
-
-      return make_pair(cache_entry, false);
-    }
-
-  public:
     // Insert a pair <key, data> into the cache. If successful, it returns a pointer
     // to the data in the cache. Otherwise, it returns nullptr.
     Data *insert(Key &&key, Data &&data)
     {
-      using CacheEntry = typename Cache<Key, Data, Cmp>::CacheEntry;
+      using CacheEntry = CacheEntry;
+
+      scoped_lock lock(mtx);
+
       assert(hash_table.size() <= cache_size);
 
-      pair<CacheEntry*, bool> p = thread_safe_contains_or_insert_in_hash_table(move(key));
-
-      if (const bool is_in_table = p.second)
+      CacheEntry *cache_entry = hash_table.search(key);
+      if (cache_entry != nullptr)
         return nullptr;
 
-      CacheEntry *cache_entry = p.first;
+      cache_entry = allocate_entry(key);
+      do_mru(cache_entry);
       scoped_lock entry_lock(cache_entry->mtx());
       cache_entry->set_data(std::move(data));
       cache_entry->set_status(CacheEntry::Status::READY);
@@ -540,11 +503,11 @@ class Cache
 
     bool has(const Key &key)
     {
-      assert(hash_table.size() <= cache_size);
-
       const CacheEntry entry(key);
 
       scoped_lock lock(mtx);
+
+      assert(hash_table.size() <= cache_size);
 
       auto cache_entry = hash_table.search(entry);
 

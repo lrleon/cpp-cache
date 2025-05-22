@@ -585,6 +585,13 @@ TEST_F(TimeConsumingFixture, multithread_heavy_threads)
 
 TEST_F(TimeConsumingFixture, random_multithread_heavy_threads)
 {
+  vector<pair<int, int>> pairs;
+  pairs.reserve(Num_Threads * Num_Keys);
+  auto it = pairs.begin();
+  for (int i = 0; i < Num_Keys; ++i)
+    for (int j = 0; j < Num_Threads; ++j, ++it)
+      pairs.emplace_back(i, j);
+
   for (int k = 0; k < 500; k++)
     {
       cout << "Iteration: " << k << endl << endl;
@@ -593,18 +600,9 @@ TEST_F(TimeConsumingFixture, random_multithread_heavy_threads)
       mutex results_mutex;
       unsigned long long result_index = 0;
 
-      vector<pair<int, int>> pairs;
-      pairs.reserve(Num_Threads * Num_Keys);
-      auto it = pairs.begin();
-      for (int i = 0; i < Num_Keys; ++i)
-        for (int j = 0; j < Num_Threads; ++j, ++it)
-          pairs.emplace_back(i, j);
-
       std::random_shuffle(pairs.begin(), pairs.end());
 
       for (auto [i, j]: pairs)
-        {
-          cout << i << " " << j << endl;
           threads.emplace_back([this, i, j, &results, &results_mutex, &result_index]()
                                {
                                    const pair<int *, int8_t> result =
@@ -613,7 +611,6 @@ TEST_F(TimeConsumingFixture, random_multithread_heavy_threads)
                                    results[i * Num_Threads + j] = result;
                                    ++result_index;
                                });
-        }
 
       for (auto &t: threads)
         t.join();
