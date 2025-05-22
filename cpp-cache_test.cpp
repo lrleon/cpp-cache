@@ -159,8 +159,7 @@ TEST_F(SimpleFixture, lru)
   ASSERT_NE(cache.get_lru_entry()->key(), 90);
 
   // remove lru entry
-  unique_lock<mutex> entry_lock(cache.get_lru_entry()->mtx());
-  cache.remove_entry_from_hash_table(entry_lock, cache.get_lru_entry());
+  cache.remove_entry_from_hash_table(cache.get_lru_entry());
 
   ASSERT_EQ(cache.size(), 1);
 
@@ -373,32 +372,21 @@ struct TimeConsumingFixture : public Test
 {
   static constexpr int Num_Threads = 20;
   static constexpr int Num_Keys = 31;
+  static constexpr float Processing_Time = 0.5;
   static bool miss_handler(const int &key, int *data,
                            int8_t &ad_hoc_code, void *)
   {
     *data = key * 10;
     ++ad_hoc_code; // never must be greater than 1
-    sleep(2);
+    sleep(Processing_Time);
 
     if (key == 51) {
       int aux = 0;
     }
 
-    // burn CPU
-    // unsigned long long i = 0;
-    // unsigned long long j = 0;
-    // for (i = 0; i < 100000000; ++i)
-    //   {
-    //     j = i * i;
-    //     j = j / 2;
-    //   }
-
     cout << "Miss handler finished for key: " << key << endl
           << "ad_hoc_code: " << (int)ad_hoc_code << endl
           << "data: " << *data << endl;
-          // << "i: " << i << endl
-          // << "j: " << j << endl;
-
     return true;
   }
 
@@ -410,36 +398,6 @@ struct TimeConsumingFixture : public Test
     // empty
   }
 };
-
-TEST_F(TimeConsumingFixture, calculating_status_while_computing)
-{
-  using CacheEntry = Cache<int, int>::CacheEntry;
-  CacheEntry entry(1);
-  CacheEntry *cache_entry = &entry;
-  auto future =
-    std::async(std::launch::async, [this, &cache_entry]()
-    {
-      unique_lock entry_lock(cache_entry->mtx());
-      return cache.resolve_cache_miss(entry_lock, cache_entry,
-                                      high_resolution_clock::now(), nullptr);
-    });
-
-  // wait 1 s
-  sleep(1);
-  cout << CacheEntry::status_to_string(cache_entry->status()) << endl;
-  ASSERT_EQ(cache_entry->status(), CacheEntry::Status::CALCULATING);
-
-  // wait miss handler to finish
-  const int *res = future.get();
-
-  cout << CacheEntry::status_to_string(cache_entry->status()) << endl;
-  ASSERT_EQ(cache_entry->status(), CacheEntry::Status::READY);
-  ASSERT_FALSE(cache_entry->has_ttl_expired(high_resolution_clock::now()));
-
-  ASSERT_EQ(*res, 10);
-  ASSERT_EQ(cache_entry->ad_hoc_code(), 1);
-  ASSERT_EQ(cache_entry->get_data(), 10);
-}
 
 TEST_F(TimeConsumingFixture, two_threads)
 {
@@ -469,12 +427,11 @@ TEST_F(TimeConsumingFixture, two_threads)
 
 TEST_F(TimeConsumingFixture, multithread_cache_full)
 {
-  constexpr int N = 3;
   vector<future<pair<int *, int8_t>>> futures;
 
-  for (int i = 1; i <= 5; ++i)
+  for (int i = 1; i <= Num_Keys; ++i)
     {
-      for (int j = 0; j < N; ++j)
+      for (int j = 0; j < Num_Threads; ++j)
         {
           futures.push_back(std::async(std::launch::async, [this, i]()
           {
@@ -484,18 +441,18 @@ TEST_F(TimeConsumingFixture, multithread_cache_full)
     }
 
   vector<pair<int *, int8_t>> results;
-  for (int i = 0; i < N * 5; ++i)
+  for (int i = 0; i < Num_Threads * Num_Keys; ++i)
     results.push_back(futures[i].get());
 
-  ASSERT_EQ(cache.size(), 5);
+  ASSERT_EQ(cache.size(), Num_Keys);
 
-  for (int i = 1; i <= 5; ++i)
+  for (int i = 1; i <= Num_Keys; ++i)
     ASSERT_TRUE(cache.has(i));
 
-  for (int i = 0; i < N * 5; i += N)
+  for (int i = 0; i < Num_Threads * Num_Keys; i += Num_Threads)
     {
       auto res_i = results[i];
-      for (int j = 1; j < N; ++j)
+      for (int j = 1; j < Num_Threads; ++j)
         {
           auto res_j = results[i + j];
           ASSERT_EQ(res_i.first, res_j.first); // same address
@@ -509,12 +466,11 @@ TEST_F(TimeConsumingFixture, multithread_heavy_futures)
 {
   for (int k = 0; k < 20; k++)
     {
-      constexpr int N = 20;
       vector<future<pair<int *, int8_t>>> futures;
 
-      for (int i = 1; i <= 5; ++i)
+      for (int i = 1; i <= Num_Keys; ++i)
         {
-          for (int j = 0; j < N; ++j)
+          for (int j = 0; j < Num_Threads; ++j)
             {
               futures.push_back(std::async(std::launch::async, [this, i]()
               {
@@ -524,18 +480,18 @@ TEST_F(TimeConsumingFixture, multithread_heavy_futures)
         }
 
       vector<pair<int *, int8_t>> results;
-      for (int i = 0; i < N * 5; ++i)
+      for (int i = 0; i < Num_Threads * Num_Keys; ++i)
         results.push_back(futures[i].get());
 
-      ASSERT_EQ(cache.size(), 5);
+      ASSERT_EQ(cache.size(), Num_Keys);
 
-      for (int i = 1; i <= 5; ++i)
+      for (int i = 1; i <= Num_Keys; ++i)
         ASSERT_TRUE(cache.has(i));
 
-      for (int i = 0; i < N * 5; i += N)
+      for (int i = 0; i < Num_Threads * Num_Keys; i += Num_Threads)
         {
           auto res_i = results[i];
-          for (int j = 1; j < N; ++j)
+          for (int j = 1; j < Num_Threads; ++j)
             {
               auto res_j = results[i + j];
               ASSERT_EQ(res_i.first, res_j.first); // same address
@@ -594,7 +550,7 @@ TEST_F(TimeConsumingFixture, multithread_heavy_threads)
 
 TEST_F(TimeConsumingFixture, multithread_heavy_threads_full)
 {
-  for (int k = 0; k < 5; k++)
+  for (int k = 0; k < 500; k++)
     {
       vector<thread> threads;
       vector<pair<int *, int8_t>> results(Num_Threads * (Num_Keys + 1));
@@ -631,17 +587,17 @@ TEST_F(TimeConsumingFixture, multithread_heavy_threads_full)
       // for (int i = 1; i <= 5; ++i)
       //   ASSERT_TRUE(cache.has(i));
 
-      // for (int i = 0; i < Num_Threads * 5; i += Num_Threads)
-      //   {
-      //     auto res_i = results[i];
-      //     for (int j = 1; j < Num_Threads; ++j)
-      //       {
-      //         auto res_j = results[i + j];
-      //         ASSERT_EQ(*res_i.first, *res_j.first);
-      //         ASSERT_EQ(res_i.first, res_j.first); // same address
-      //         ASSERT_EQ(res_i.second, res_j.second);
-      //       }
-      //   }
+      for (int i = 0; i < Num_Threads * 5; i += Num_Threads)
+        {
+          auto res_i = results[i];
+          for (int j = 1; j < Num_Threads; ++j)
+            {
+              auto res_j = results[i + j];
+              ASSERT_EQ(*res_i.first, *res_j.first);
+              ASSERT_EQ(res_i.first, res_j.first); // same address
+              ASSERT_EQ(res_i.second, res_j.second);
+            }
+        }
     }
 }
 
