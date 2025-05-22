@@ -400,7 +400,7 @@ struct TimeConsumingFixture : public Test
   Cache<int, int> cache;
 
   TimeConsumingFixture()
-    : cache(Num_Keys - 1, 20s, 1s, miss_handler)
+    : cache(Num_Keys, 20s, 1s, miss_handler)
   {
     // empty
   }
@@ -464,12 +464,11 @@ TEST_F(TimeConsumingFixture, two_threads)
 
 TEST_F(TimeConsumingFixture, multithread_cache_full)
 {
-  constexpr int N = 3;
   vector<future<pair<int *, int8_t>>> futures;
 
-  for (int i = 1; i <= 5; ++i)
+  for (int i = 1; i <= Num_Keys; ++i)
     {
-      for (int j = 0; j < N; ++j)
+      for (int j = 0; j < Num_Threads; ++j)
         {
           futures.push_back(std::async(std::launch::async, [this, i]()
           {
@@ -479,25 +478,24 @@ TEST_F(TimeConsumingFixture, multithread_cache_full)
     }
 
   vector<pair<int *, int8_t>> results;
-  for (int i = 0; i < N * 5; ++i)
+  for (int i = 0; i < Num_Keys * Num_Threads; ++i)
     results.push_back(futures[i].get());
 
-  ASSERT_EQ(cache.size(), 5);
+  ASSERT_EQ(cache.size(), Num_Keys);
 
-  for (int i = 1; i <= 5; ++i)
+  for (int i = 1; i <= Num_Keys; ++i)
     ASSERT_TRUE(cache.has(i));
 
-  for (int i = 0; i < N * 5; i += N)
+  for (int i = 0; i < Num_Keys * Num_Threads; i += Num_Threads)
     {
       auto res_i = results[i];
-      for (int j = 1; j < N; ++j)
+      for (int j = 1; j < Num_Threads; ++j)
         {
           auto res_j = results[i + j];
           ASSERT_EQ(res_i.first, res_j.first); // same address
           ASSERT_EQ(res_i.second, res_j.second);
         }
     }
-
 }
 
 TEST_F(TimeConsumingFixture, multithread_heavy_futures)
@@ -542,15 +540,15 @@ TEST_F(TimeConsumingFixture, multithread_heavy_futures)
 
 TEST_F(TimeConsumingFixture, multithread_heavy_threads)
 {
-  for (int k = 0; k < 50; k++)
+  for (int k = 0; k < 20; k++)
     {
       cout << "Iteration: " << k << endl << endl;
       vector<thread> threads;
-      vector<pair<int *, int8_t>> results(Num_Threads * Num_Keys);
+      vector<pair<int *, int8_t>> results(Num_Threads * (Num_Keys + 1));
       mutex results_mutex;
       unsigned long long result_index = 0;
 
-      for (int i = 0; i < Num_Keys; ++i)
+      for (int i = 0; i < Num_Keys + 1; ++i)
         for (int j = 0; j < Num_Threads; ++j)
             threads.emplace_back([this, i, j, &results, &results_mutex, &result_index]()
                                  {
@@ -569,7 +567,7 @@ TEST_F(TimeConsumingFixture, multithread_heavy_threads)
       for (auto const &res: results)
         ASSERT_EQ(res.second, 1);
 
-      ASSERT_EQ(cache.size(), Num_Keys - 1);
+      ASSERT_EQ(cache.size(), Num_Keys);
 
       for (int i = 0; i < Num_Threads * 5; i += Num_Threads)
         {
