@@ -540,7 +540,7 @@ TEST_F(TimeConsumingFixture, multithread_heavy_futures)
 
 TEST_F(TimeConsumingFixture, multithread_heavy_threads)
 {
-  for (int k = 0; k < 20; k++)
+  for (int k = 0; k < 500; k++)
     {
       cout << "Iteration: " << k << endl << endl;
       vector<thread> threads;
@@ -585,7 +585,7 @@ TEST_F(TimeConsumingFixture, multithread_heavy_threads)
 
 TEST_F(TimeConsumingFixture, random_multithread_heavy_threads)
 {
-  for (int k = 0; k < 50; k++)
+  for (int k = 0; k < 500; k++)
     {
       cout << "Iteration: " << k << endl << endl;
       vector<thread> threads;
@@ -623,7 +623,7 @@ TEST_F(TimeConsumingFixture, random_multithread_heavy_threads)
       for (auto const &res: results)
         ASSERT_EQ(res.second, 1);
 
-      ASSERT_EQ(cache.size(), Num_Keys - 1);
+      ASSERT_EQ(cache.size(), Num_Keys);
 
       for (int i = 0; i < Num_Threads * 5; i += Num_Threads)
         {
