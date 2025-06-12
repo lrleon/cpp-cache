@@ -564,7 +564,36 @@ class Cache
       // ah_domain_error_if(lru_entry->status() = CacheEntry::Status::CALCULATING)
       //   << "LRU entry is in CALCULATING state. This could be a bug or a cache misconfiguration";
       if (lru_entry->status() == CacheEntry::Status::CALCULATING)
+      {
+        constexpr const char* msg = R"(__        ___    ____  _   _ ___ _   _  ____     _     ____  _   _
+\ \      / / \  |  _ \| \ | |_ _| \ | |/ ___|_  | |   |  _ \| | | |
+ \ \ /\ / / _ \ | |_) |  \| || ||  \| | |  _(_) | |   | |_) | | | |
+  \ V  V / ___ \|  _ <| |\  || || |\  | |_| |_  | |___|  _ <| |_| |
+   \_/\_/_/   \_\_| \_\_| \_|___|_| \_|\____(_) |_____|_| \_\\___/
+
+ _____ _   _ _____ ______   __  ___ ____    ___ _   _
+| ____| \ | |_   _|  _ \ \ / / |_ _/ ___|  |_ _| \ | |
+|  _| |  \| | | | | |_) \ V /   | |\___ \   | ||  \| |
+| |___| |\  | | | |  _ < | |    | | ___) |  | || |\  |
+|_____|_| \_| |_| |_| \_\|_|   |___|____/  |___|_| \_|
+
+ ____ _____  _  _____ _____
+/ ___|_   _|/ \|_   _| ____|
+\___ \ | | / _ \ | | |  _|
+ ___) || |/ ___ \| | | |___
+|____/ |_/_/   \_\_| |_____|
+
+  ____    _    _     ____ _   _ _        _  _____ ___ _   _  ____
+ / ___|  / \  | |   / ___| | | | |      / \|_   _|_ _| \ | |/ ___|
+| |     / _ \ | |  | |   | | | | |     / _ \ | |  | ||  \| | |  _
+| |___ / ___ \| |__| |___| |_| | |___ / ___ \| |  | || |\  | |_| |
+ \____/_/   \_\_____\____|\___/|_____/_/   \_\_| |___|_| \_|\____|
+
+
+                                                                  )";
+        cout << msg << endl;
         return {nullptr, false};
+        }
 
       remove_entry_from_hash_table(lru_entry);
       return {lru_entry, true} ;
@@ -575,8 +604,7 @@ class Cache
       CacheEntry* cache_entry = nullptr;
       if (hash_table.size() >= cache_size)
         {
-          auto p = evict_lru_entry();
-          if (!p.second)
+          if (auto p = evict_lru_entry(); !p.second)
             return {nullptr, false};
         }
       cache_entry = hash_table.insert(CacheEntry(key));
@@ -628,7 +656,6 @@ class Cache
       if (!p.second)
         {
           cache_lock.unlock();
-          cache_entry = new CacheEntry(key);
           miss_handler(cache_entry->key(), cache_entry->data_ptr(),
                       cache_entry->ad_hoc_code(), cookie);
           return {cache_entry->data_ptr(), cache_entry->ad_hoc_code()};
