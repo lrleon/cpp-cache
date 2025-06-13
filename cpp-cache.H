@@ -432,7 +432,7 @@ class Cache
     using MissHandlerType =
     std::function<bool(const Key &, Data *, int8_t &, void *)>;
 
-    static constexpr float ratio = 1.3f;
+    static constexpr float ratio = 1.15f;
 
     MissHandlerType miss_handler;
 
