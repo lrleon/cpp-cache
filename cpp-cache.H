@@ -470,7 +470,7 @@ class Cache
 
       scoped_lock lock(mtx);
 
-      CacheEntry* cache_entry = hash_table.search(CacheEntry(key));
+      CacheEntry *cache_entry = hash_table.search(CacheEntry(key));
 
       if (cache_entry != nullptr)
         return cache_entry->data_ptr();
@@ -484,7 +484,6 @@ class Cache
       cache_entry->set_data(std::move(data));
       cache_entry->set_status(CacheEntry::Status::READY);
       cache_entry->set_ttl_exp_time(high_resolution_clock::now() + positive_ttl);
-
 
       return cache_entry->data_ptr();
     }
@@ -556,16 +555,16 @@ class Cache
     {
       return get_extreme_from_lrl_list(&Cache<Key, Data, Cmp>::get_mru_entry);
     }
-    
+
     pair<CacheEntry*, bool> evict_lru_entry()
     {
-      CacheEntry* lru_entry = get_lru_entry();
+      CacheEntry *lru_entry = get_lru_entry();
       unique_lock<mutex> entry_lock(lru_entry->mtx());
       // ah_domain_error_if(lru_entry->status() = CacheEntry::Status::CALCULATING)
       //   << "LRU entry is in CALCULATING state. This could be a bug or a cache misconfiguration";
       if (lru_entry->status() == CacheEntry::Status::CALCULATING)
-      {
-        constexpr const char* msg = R"(__        ___    ____  _   _ ___ _   _  ____     _     ____  _   _
+        {
+          constexpr const char *msg = R"(__        ___    ____  _   _ ___ _   _  ____     _     ____  _   _
 \ \      / / \  |  _ \| \ | |_ _| \ | |/ ___|_  | |   |  _ \| | | |
  \ \ /\ / / _ \ | |_) |  \| || ||  \| | |  _(_) | |   | |_) | | | |
   \ V  V / ___ \|  _ <| |\  || || |\  | |_| |_  | |___|  _ <| |_| |
@@ -589,19 +588,18 @@ class Cache
 | |___ / ___ \| |__| |___| |_| | |___ / ___ \| |  | || |\  | |_| |
  \____/_/   \_\_____\____|\___/|_____/_/   \_\_| |___|_| \_|\____|
 
-
                                                                   )";
-        cout << msg << endl;
-        return {nullptr, false};
+          cout << msg << endl;
+          return {nullptr, false};
         }
 
       remove_entry_from_hash_table(lru_entry);
-      return {lru_entry, true} ;
+      return {lru_entry, true};
     }
 
     pair<CacheEntry*, bool> allocate_entry(const Key &key, time_point<high_resolution_clock> time_now)
     {
-      CacheEntry* cache_entry = nullptr;
+      CacheEntry *cache_entry = nullptr;
       if (hash_table.size() >= cache_size)
         {
           if (auto p = evict_lru_entry(); !p.second)
@@ -631,24 +629,25 @@ class Cache
         {
           // cache hit
           if (has_entry_ttl_expired(cache_entry, time_now))
-              remove_entry_from_hash_table(cache_entry);
-          else {
-            do_mru(cache_entry);
-            cache_lock.unlock();
-            unique_lock entry_lock(cache_entry->mtx());
-            cache_entry->waiting_cv().wait(entry_lock, [cache_entry]
+            remove_entry_from_hash_table(cache_entry);
+          else
             {
-              return cache_entry->status() == CacheEntry::Status::READY or
-                     cache_entry->status() == CacheEntry::Status::FAILED;
-            });
+              do_mru(cache_entry);
+              cache_lock.unlock();
+              unique_lock entry_lock(cache_entry->mtx());
+              cache_entry->waiting_cv().wait(entry_lock, [cache_entry]
+              {
+                return cache_entry->status() == CacheEntry::Status::READY or
+                       cache_entry->status() == CacheEntry::Status::FAILED;
+              });
 
-            cache_entry->set_ttl_exp_time(time_now +
-                                          (cache_entry->status() == CacheEntry::Status::READY
-                                            ? positive_ttl
-                                            : negative_ttl));
+              cache_entry->set_ttl_exp_time(time_now +
+                                            (cache_entry->status() == CacheEntry::Status::READY
+                                               ? positive_ttl
+                                               : negative_ttl));
 
-            return {cache_entry->data_ptr(), cache_entry->ad_hoc_code()};
-          }
+              return {cache_entry->data_ptr(), cache_entry->ad_hoc_code()};
+            }
         }
 
       // cache miss
@@ -657,16 +656,16 @@ class Cache
         {
           cache_lock.unlock();
           miss_handler(cache_entry->key(), cache_entry->data_ptr(),
-                      cache_entry->ad_hoc_code(), cookie);
+                       cache_entry->ad_hoc_code(), cookie);
           return {cache_entry->data_ptr(), cache_entry->ad_hoc_code()};
         }
-      
+
       cache_entry = p.first;
       cache_lock.unlock();
       unique_lock entry_lock(cache_entry->mtx());
       cache_entry->set_status(CacheEntry::Status::CALCULATING);
       if (miss_handler(cache_entry->key(), cache_entry->data_ptr(),
-                        cache_entry->ad_hoc_code(), cookie))
+                       cache_entry->ad_hoc_code(), cookie))
         {
           cache_entry->set_ttl_exp_time(time_now + positive_ttl);
           cache_entry->set_status(CacheEntry::Status::READY);
