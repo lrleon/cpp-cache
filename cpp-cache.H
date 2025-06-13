@@ -560,11 +560,8 @@ class Cache
     {
       CacheEntry *lru_entry = get_lru_entry();
       unique_lock<mutex> entry_lock(lru_entry->mtx());
-      // ah_domain_error_if(lru_entry->status() = CacheEntry::Status::CALCULATING)
-      //   << "LRU entry is in CALCULATING state. This could be a bug or a cache misconfiguration";
-      if (lru_entry->status() == CacheEntry::Status::CALCULATING)
-        {
-          constexpr const char *msg = R"(__        ___    ____  _   _ ___ _   _  ____     _     ____  _   _
+      ah_domain_error_if(lru_entry->status() == CacheEntry::Status::CALCULATING)
+      << R"(__        ___    ____  _   _ ___ _   _  ____     _     ____  _   _
 \ \      / / \  |  _ \| \ | |_ _| \ | |/ ___|_  | |   |  _ \| | | |
  \ \ /\ / / _ \ | |_) |  \| || ||  \| | |  _(_) | |   | |_) | | | |
   \ V  V / ___ \|  _ <| |\  || || |\  | |_| |_  | |___|  _ <| |_| |
@@ -589,9 +586,6 @@ class Cache
  \____/_/   \_\_____\____|\___/|_____/_/   \_\_| |___|_| \_|\____|
 
                                                                   )";
-          cout << msg << endl;
-          return {nullptr, false};
-        }
 
       remove_entry_from_hash_table(lru_entry);
       return {lru_entry, true};
