@@ -484,7 +484,7 @@ public:
     cache_entry = p.first;
     scoped_lock entry_lock(cache_entry->mtx());
 
-    Data().swap(data);
+    Data().swap(data); // clear data ==> free memory
 
     cache_entry->set_data(std::move(data));
     cache_entry->set_status(CacheEntry::Status::READY);
