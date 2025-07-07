@@ -10,7 +10,6 @@
 # include <mutex>
 # include <condition_variable>
 # include <aleph.H>
-# include <tpl_dnode.H>
 
 # include <tpl_olhash.H>
 
@@ -142,11 +141,13 @@ class Cache
 
     void set_data(const Data &d)
     {
+      Data().swap(_data); // make sure to free memory
       _data = d;
     }
 
     void set_data(Data &&d)
     {
+      Data().swap(_data); // make sure to free memory
       _data = move(d);
     }
 
@@ -385,6 +386,10 @@ protected:
     cache_entry->set_status(CacheEntry::Status::AVAILABLE);
     cache_entry->link_lru()->del();
     hash_table.remove(*cache_entry);
+
+    // free the memory occupied by the entry
+    Key().Swap(&cache_entry->key());
+    Data().swap(cache_entry->data());
   }
 
   // searches and returns the next entry according to lru priority that does not have
@@ -474,17 +479,15 @@ public:
 
     CacheEntry *cache_entry = hash_table.search(CacheEntry(key));
 
-    if (cache_entry != nullptr)
+    if (cache_entry != nullptr) // found?
       return cache_entry->data_ptr();
 
     auto p = allocate_entry(key, high_resolution_clock::now());
-    ah_domain_error_if(!p.second)
+    ah_domain_error_if(not p.second)
             << "lru entry is in CALCULATING state. This could be a bug or a cache misconfiguration";
 
     cache_entry = p.first;
     scoped_lock entry_lock(cache_entry->mtx());
-
-    Data().swap(data); // clear data ==> free memory
 
     cache_entry->set_data(std::move(data));
     cache_entry->set_status(CacheEntry::Status::READY);
@@ -589,12 +592,7 @@ public:
 | |     / _ \ | |  | |   | | | | |     / _ \ | |  | ||  \| | |  _
 | |___ / ___ \| |__| |___| |_| | |___ / ___ \| |  | || |\  | |_| |
  \____/_/   \_\_____\____|\___/|_____/_/   \_\_| |___|_| \_|\____|
-
                                                                   )";
-
-    vector<uint8_t>().swap(lru_entry->data());
-
-    Key().Swap(const_cast<Key *>(&lru_entry->key()));
 
     remove_entry_from_hash_table(lru_entry);
     return {lru_entry, true};
@@ -655,7 +653,7 @@ public:
 
     // cache miss
     auto p = allocate_entry(key, time_now);
-    if (!p.second)
+    if (not p.second)
     {
       cache_lock.unlock();
       miss_handler(cache_entry->key(), cache_entry->data_ptr(),
