@@ -483,6 +483,9 @@ public:
 
     cache_entry = p.first;
     scoped_lock entry_lock(cache_entry->mtx());
+
+    Data().swap(data);
+
     cache_entry->set_data(std::move(data));
     cache_entry->set_status(CacheEntry::Status::READY);
     cache_entry->set_ttl_exp_time(high_resolution_clock::now() + positive_ttl);
