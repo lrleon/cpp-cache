@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      ALEPH_DIR: ${{ github.workspace }}/../Aleph-w
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgtest-dev libgsl-dev
+
+      - name: Fetch Aleph-w dependency
+        run: git clone --depth=1 https://github.com/lrleon/Aleph-w.git "$ALEPH_DIR"
+
+      - name: Configure CMake
+        run: cmake -S . -B build -G Ninja -DALEPH_DIR="$ALEPH_DIR"
+
+      - name: Build unit and concurrency tests
+        run: cmake --build build --target cache_unit_test cache_concurrency_test
+
+      - name: Run test suite
+        run: ctest --test-dir build --output-on-failure
