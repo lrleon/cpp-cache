@@ -403,6 +403,10 @@ private:
     // Should not already exist as we searched for it just above
     assert(not existed);
 
+    // Mark as Computing immediately so the entry is never evictable
+    // between insertion and the solver run (fixes audit bug 1.1).
+    entry_ptr->set_state(EntryState::Computing);
+
     lru_insert_as_mru(entry_ptr);
     return {entry_ptr, false};
   }
@@ -483,39 +487,47 @@ private:
    * This method implements the single-flight logic by marking the entry as
    * Computing before dropping the lock and running the solver.
    */
-  CacheResult<Value> resolve_miss(CacheEntry *entry, const std::chrono::steady_clock::time_point &now)
+  CacheResult<Value> resolve_miss(CacheEntry *entry,
+                                  const std::chrono::steady_clock::time_point &now,
+                                  bool owner = false)
   {
     std::unique_lock entry_lock(entry->mtx());
 
-    // Double-check: another thread might have started computing between our initial
-    // check and acquiring the entry lock (Double-Checked Locking pattern).
-    if (entry->state() == EntryState::Computing)
+    if (not owner)
       {
-        entry->cv().wait(entry_lock,
-                         [entry]
-        {
-          return entry->state() != EntryState::Computing;
-        });
+        // Double-check: another thread might have started computing between our initial
+        // check and acquiring the entry lock (Double-Checked Locking pattern).
+        if (entry->state() == EntryState::Computing)
+          {
+            entry->cv().wait(entry_lock,
+                             [entry]
+            {
+              return entry->state() != EntryState::Computing;
+            });
 
-        // Re-check after waiting
+            // Re-check after waiting
+            if (entry->state() == EntryState::Ready)
+              return CacheResult<Value>::hit_positive(entry->value());
+
+            if (entry->state() == EntryState::Failed)
+              return CacheResult<Value>::hit_negative();
+          }
+
+        // If entry is already Ready/Failed (e.g., race where two threads saw miss,
+        // one finished while the other was still entering resolve_miss).
         if (entry->state() == EntryState::Ready)
           return CacheResult<Value>::hit_positive(entry->value());
 
         if (entry->state() == EntryState::Failed)
           return CacheResult<Value>::hit_negative();
+
+        // We are the winning thread: mark as Computing and release lock before calling solver.
+        // Releasing the lock is vital to allow other threads to access other keys.
+        entry->set_state(EntryState::Computing);
       }
 
-    // If entry is already Ready/Failed (e.g., race where two threads saw miss,
-    // one finished while the other was still entering resolve_miss).
-    if (entry->state() == EntryState::Ready)
-      return CacheResult<Value>::hit_positive(entry->value());
-
-    if (entry->state() == EntryState::Failed)
-      return CacheResult<Value>::hit_negative();
-
-    // We are the winning thread: mark as Computing and release lock before calling solver.
-    // Releasing the lock is vital to allow other threads to access other keys.
-    entry->set_state(EntryState::Computing);
+    // owner == true: entry is already Computing (set in contains_or_insert_locked
+    // under global lock, fixing audit bug 1.1). Skip straight to solver.
     entry_lock.unlock();
 
     std::shared_ptr<Value> result;
@@ -583,7 +595,7 @@ public:
    * @param solver       Callable invoked on cache misses to compute values.
    * @param hash_fct     Hash function for keys (default: Aleph::dft_hash_fct).
    */
-  Cache(size_t capacity,
+  Cache(const size_t capacity,
         const std::chrono::seconds &positive_ttl,
         const std::chrono::seconds &negative_ttl,
         MissSolver solver,
@@ -652,8 +664,10 @@ public:
           return hit_result.value();
       }
 
-    // Otherwise, it's a new entry or an expired one: resolve as a miss
-    return resolve_miss(entry, now);
+    // For new entries (!existed): we are the owner — entry is already Computing
+    // (set in contains_or_insert_locked under global lock).
+    // For expired entries (existed): entry was reset to Empty by resolve_hit.
+    return resolve_miss(entry, now, !existed);
   }
 
   /**
@@ -674,7 +688,9 @@ public:
       entry = _table.search(CacheEntry(key));
       if (entry == nullptr)
         return std::nullopt;
-      lru_move_to_mru(entry);
+      // Do NOT move to MRU here: we must first confirm the entry is
+      // valid. Moving unconditionally would undo invalidate()'s LRU
+      // tail placement and allow stale entries to survive eviction.
     }
 
     const auto now = std::chrono::steady_clock::now();
@@ -695,10 +711,18 @@ public:
       }
 
     if (entry->state() == EntryState::Ready)
-      return CacheResult<Value>::hit_positive(entry->value());
+      {
+        std::scoped_lock glock(_mtx);
+        lru_move_to_mru(entry);
+        return CacheResult<Value>::hit_positive(entry->value());
+      }
 
     if (entry->state() == EntryState::Failed)
-      return CacheResult<Value>::hit_negative();
+      {
+        std::scoped_lock glock(_mtx);
+        lru_move_to_mru(entry);
+        return CacheResult<Value>::hit_negative();
+      }
 
     return std::nullopt;
   }

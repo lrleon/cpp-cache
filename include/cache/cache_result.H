@@ -61,6 +61,36 @@ public:
     // empty
   }
 
+  /** @brief Factory: positive cache hit. */
+  static CacheResult hit_positive(std::shared_ptr<Value> v)
+  {
+    return CacheResult(ResultOrigin::HitPositive, std::move(v));
+  }
+
+  /** @brief Factory: negative cache hit (cached failure). */
+  static CacheResult hit_negative()
+  {
+    return CacheResult(ResultOrigin::HitNegative, nullptr);
+  }
+
+  /** @brief Factory: freshly computed positive result. */
+  static CacheResult computed_positive(std::shared_ptr<Value> v)
+  {
+    return CacheResult(ResultOrigin::ComputedPositive, std::move(v));
+  }
+
+  /** @brief Factory: freshly computed negative result (solver failed). */
+  static CacheResult computed_negative()
+  {
+    return CacheResult(ResultOrigin::ComputedNegative, nullptr);
+  }
+
+  /** @brief Factory: cache saturated (all entries Computing). */
+  static CacheResult saturated()
+  {
+    return CacheResult(ResultOrigin::Saturated, nullptr);
+  }
+
   /** @brief Returns true if the result contains a positive value. */
   [[nodiscard]] bool is_positive() const noexcept
   {
