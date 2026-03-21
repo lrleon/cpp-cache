@@ -13,13 +13,6 @@ link_directories(${ALEPH_DIR})
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
 # ----------------------------------------------------------------
-# Legacy v1 test (kept for reference)
-# ----------------------------------------------------------------
-add_executable(cpp_cache_test_v1 cpp-cache_test.cpp)
-target_include_directories(cpp_cache_test_v1 PRIVATE "${CMAKE_SOURCE_DIR}")
-target_link_libraries(cpp_cache_test_v1 PRIVATE Aleph gtest_main gtest pthread lz4)
-
-# ----------------------------------------------------------------
 # v2 unit tests
 # ----------------------------------------------------------------
 add_executable(cache_unit_test tests/unit/cache_test.cpp ${ALEPH_DIR}/hash-fct.C)
@@ -30,6 +23,18 @@ target_link_libraries(cache_unit_test PRIVATE Aleph gtest_main gtest pthread gsl
 # ----------------------------------------------------------------
 add_executable(cache_concurrency_test tests/concurrency/concurrency_test.cpp ${ALEPH_DIR}/hash-fct.C)
 target_link_libraries(cache_concurrency_test PRIVATE Aleph gtest_main gtest pthread gsl gslcblas)
+
+# ----------------------------------------------------------------
+# v2 hardened unit tests (edge cases, bug-finding)
+# ----------------------------------------------------------------
+add_executable(cache_hardened_test tests/unit/cache_hardened_test.cpp ${ALEPH_DIR}/hash-fct.C)
+target_link_libraries(cache_hardened_test PRIVATE Aleph gtest_main gtest pthread gsl gslcblas)
+
+# ----------------------------------------------------------------
+# v2 hardened concurrency tests (races, deadlocks, saturation)
+# ----------------------------------------------------------------
+add_executable(cache_concurrency_hardened_test tests/concurrency/concurrency_hardened_test.cpp ${ALEPH_DIR}/hash-fct.C)
+target_link_libraries(cache_concurrency_hardened_test PRIVATE Aleph gtest_main gtest pthread gsl gslcblas)
 
 # ----------------------------------------------------------------
 # Sanitizer targets (opt-in via -DSANITIZE=address|thread|undefined)

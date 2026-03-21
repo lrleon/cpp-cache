@@ -4,97 +4,115 @@
 // Part of cpp-cache v2
 //
 
-# ifndef CACHE_RESULT_H
-# define CACHE_RESULT_H
+#ifndef CACHE_RESULT_H
+#define CACHE_RESULT_H
 
-# include <memory>
+#include <memory>
 
-namespace CppCache
+namespace CppCache {
+
+/**
+ * @brief Categorizes how a CacheResult was obtained.
+ */
+enum class ResultOrigin : uint8_t
 {
-  // Describes how the result was obtained
-  enum class ResultOrigin : uint8_t
+  /** @brief Retrieved a previously cached positive value. */
+  HitPositive,
+
+  /** @brief Retrieved a previously cached failure/negative result. */
+  HitNegative,
+
+  /** @brief The miss solver was just executed and returned a positive value. */
+  ComputedPositive,
+
+  /** @brief The miss solver just failed; a negative result was cached. */
+  ComputedNegative,
+
+  /** @brief The cache is full and all entries are currently Computing. */
+  Saturated
+};
+
+/**
+ * @brief A typed result representing a cache lookup outcome.
+ *
+ * For positive results, value() provides a shared_ptr to the cached data.
+ * For negative results (cacheable failures), value() returns nullptr.
+ *
+ * @tparam Value The type of the cached data.
+ *
+ * @see Cache::get_or_compute()
+ * @see Cache::find()
+ */
+template <typename Value>
+class CacheResult
+{
+  ResultOrigin _origin;
+  std::shared_ptr<Value> _value;
+
+public:
+  /**
+   * @brief Construct a CacheResult with origin and value.
+   * @param origin Where the result came from.
+   * @param value The value associated with the result (nullable).
+   */
+  CacheResult(ResultOrigin origin, std::shared_ptr<Value> value)
+    : _origin(origin), _value(std::move(value))
   {
-    HitPositive,       // Positive value retrieved from cache
-    HitNegative,       // Negative (failed) result retrieved from cache
-    ComputedPositive,  // Value just computed by miss solver and cached
-    ComputedNegative   // Miss solver just failed; negative result cached
-  };
+    // empty
+  }
 
-  // Typed result returned by Cache::get_or_compute() and Cache::find()
-  //
-  // For positive results, value() returns a non-null shared_ptr<Value>.
-  // For negative results, value() returns nullptr.
-  //
-  // The user can inspect origin() to distinguish cache hits from fresh
-  // computations, and positive from negative outcomes.
-  template <typename Value>
-  class CacheResult
+  /** @brief Returns true if the result contains a positive value. */
+  [[nodiscard]] bool is_positive() const noexcept
   {
-    ResultOrigin _origin;
-    std::shared_ptr<Value> _value;
+    return _origin == ResultOrigin::HitPositive || _origin == ResultOrigin::ComputedPositive;
+  }
 
-   public:
+  /** @brief Returns true if the result represents a cached failure/negative. */
+  [[nodiscard]] bool is_negative() const noexcept
+  {
+    return _origin == ResultOrigin::HitNegative || _origin == ResultOrigin::ComputedNegative;
+  }
 
-    CacheResult(ResultOrigin origin, std::shared_ptr<Value> value)
-      : _origin(origin), _value(std::move(value))
-    {
-      // empty
-    }
+  /** @brief Returns true if the cache was saturated (full of computing entries). */
+  [[nodiscard]] bool is_saturated() const noexcept
+  {
+    return _origin == ResultOrigin::Saturated;
+  }
 
-    // Convenience factories
-    static CacheResult hit_positive(std::shared_ptr<Value> v)
-    {
-      return CacheResult(ResultOrigin::HitPositive, std::move(v));
-    }
+  /** @brief Returns true if the result was a cache hit (positive or negative). */
+  [[nodiscard]] bool is_hit() const noexcept
+  {
+    return _origin == ResultOrigin::HitPositive || _origin == ResultOrigin::HitNegative;
+  }
 
-    static CacheResult hit_negative()
-    {
-      return CacheResult(ResultOrigin::HitNegative, nullptr);
-    }
+  /** @brief Returns true if the result was computed during the current call. */
+  [[nodiscard]] bool was_computed() const noexcept
+  {
+    return _origin == ResultOrigin::ComputedPositive || _origin == ResultOrigin::ComputedNegative;
+  }
 
-    static CacheResult computed_positive(std::shared_ptr<Value> v)
-    {
-      return CacheResult(ResultOrigin::ComputedPositive, std::move(v));
-    }
+  /** @brief Returns the internal origin of the result. */
+  [[nodiscard]] ResultOrigin origin() const noexcept
+  {
+    return _origin;
+  }
 
-    static CacheResult computed_negative()
-    {
-      return CacheResult(ResultOrigin::ComputedNegative, nullptr);
-    }
+  /**
+   * @brief Returns the cached value.
+   * @return A shared_ptr to the value (non-null only if is_positive() is true).
+   */
+  const std::shared_ptr<Value> &value() const noexcept
+  {
+    return _value;
+  }
 
-    ResultOrigin origin() const noexcept { return _origin; }
+  /** @brief Convenience operator for boolean contexts; true if positive. */
+  explicit operator bool() const noexcept
+  {
+    return is_positive();
+  }
+};
 
-    bool is_positive() const noexcept
-    {
-      return _origin == ResultOrigin::HitPositive ||
-             _origin == ResultOrigin::ComputedPositive;
-    }
+}  // namespace CppCache
 
-    bool is_negative() const noexcept
-    {
-      return _origin == ResultOrigin::HitNegative ||
-             _origin == ResultOrigin::ComputedNegative;
-    }
-
-    bool is_hit() const noexcept
-    {
-      return _origin == ResultOrigin::HitPositive ||
-             _origin == ResultOrigin::HitNegative;
-    }
-
-    bool was_computed() const noexcept
-    {
-      return _origin == ResultOrigin::ComputedPositive ||
-             _origin == ResultOrigin::ComputedNegative;
-    }
-
-    // Returns the cached value. Non-null only for positive results.
-    const std::shared_ptr<Value> & value() const noexcept { return _value; }
-
-    // Convenience: true if positive (value is available)
-    explicit operator bool() const noexcept { return is_positive(); }
-  };
-
-} // namespace CppCache
-
-# endif // CACHE_RESULT_H
+#endif  // CACHE_RESULT_H

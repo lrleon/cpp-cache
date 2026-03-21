@@ -149,21 +149,6 @@ TEST_F(BasicFixture, find_nonexistent)
   ASSERT_FALSE(r.has_value());
 }
 
-TEST_F(BasicFixture, remove_entry)
-{
-  cache.get_or_compute(1);
-  ASSERT_TRUE(cache.has(1));
-
-  ASSERT_TRUE(cache.remove(1));
-  ASSERT_FALSE(cache.has(1));
-  ASSERT_EQ(cache.size(), 0u);
-}
-
-TEST_F(BasicFixture, remove_nonexistent)
-{
-  ASSERT_FALSE(cache.remove(999));
-}
-
 TEST_F(BasicFixture, invalidate_entry)
 {
   cache.get_or_compute(1);

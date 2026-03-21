@@ -128,6 +128,25 @@ cmake .. -DSANITIZE=address   # AddressSanitizer
 cmake .. -DSANITIZE=undefined # UBSan
 ```
 
+## Continuous Integration & AI Reviews
+
+GitHub Actions runs automatically on pushes and pull requests:
+
+- `.github/workflows/ci.yml` builds both test suites with Ninja, pulling
+  `Aleph-w` as a sibling checkout, and executes `ctest`.
+- `.github/workflows/coderabbit.yml` invokes CodeRabbit for incremental PR
+  reviews. Requires repository secrets: `OPENAI_API_KEY` (OpenAI) and the
+  default `GITHUB_TOKEN`.
+- `.github/workflows/codex-review.yml` runs OpenAI Codex with a concurrency/
+  cache-focused prompt and posts findings back to the PR. Reuses the same
+  `OPENAI_API_KEY` secret.
+
+To add GitHub Copilot as a reviewer, create a repository ruleset under
+**Settings → Code and automation → Rules → Rulesets**, enable **Automatically
+request Copilot code review**, and optionally allow reviews on drafts / new
+pushes. Copilot follows repository-level instructions in `.github/instructions/`
+if present.
+
 ## Design Decisions
 
 - **`shared_ptr<Value>` ownership** — separates logical validity in the cache from physical lifetime of the value object. External holders keep the value alive even after eviction/invalidation.
