@@ -849,3 +849,95 @@ TEST(RAIISafetyTest, mutex_not_stuck_after_operations)
 
   EXPECT_EQ(cache.size(), 1u);
 }
+
+// ================================================================
+// Section 14: Concurrent touch() around TTL expiry
+// ================================================================
+
+TEST(ConcurrentTouchExpiryTest, touch_during_ttl_expiry)
+{
+  // Multiple threads call touch() and has() right around TTL expiry.
+  // No crash or undefined behavior should occur.
+
+  Cache<int, int> cache(5, 1s, 1s,
+    [](const int &key) -> shared_ptr<int>
+    {
+      return make_shared<int>(key * 10);
+    });
+
+  for (int round = 0; round < 20; ++round)
+    {
+      cache.get_or_compute(1);
+      ASSERT_TRUE(cache.has(1));
+
+      // Wait until close to expiry
+      this_thread::sleep_for(900ms);
+
+      // Launch threads that race around the expiry boundary
+      constexpr int N = 10;
+      vector<thread> threads;
+
+      for (int i = 0; i < N; ++i)
+        threads.emplace_back([&, i]()
+        {
+          this_thread::sleep_for(chrono::milliseconds(i * 20));
+          cache.touch(1);  // may succeed or fail depending on timing
+          cache.has(1);    // same
+        });
+
+      for (auto &t : threads)
+        t.join();
+
+      // After all threads, ensure cache is still usable
+      auto r = cache.get_or_compute(1);
+      ASSERT_TRUE(r.is_positive());
+      ASSERT_EQ(*r.value(), 10);
+    }
+}
+
+// ================================================================
+// Section 15: invalidate() during TTL expiry
+// ================================================================
+
+TEST(ConcurrentInvalidateExpiryTest, invalidate_races_with_expiry_and_recompute)
+{
+  atomic<int> solver_calls{0};
+
+  Cache<int, int> cache(5, 1s, 1s,
+    [&](const int &key) -> shared_ptr<int>
+    {
+      solver_calls.fetch_add(1);
+      return make_shared<int>(key * 10);
+    });
+
+  for (int round = 0; round < 30; ++round)
+    {
+      cache.get_or_compute(1);
+
+      // Wait until close to expiry
+      this_thread::sleep_for(900ms);
+
+      // Race: one thread invalidates, another tries get_or_compute
+      thread t1([&]()
+      {
+        this_thread::sleep_for(100ms); // right around expiry
+        cache.invalidate(1);
+      });
+
+      thread t2([&]()
+      {
+        this_thread::sleep_for(100ms);
+        auto r = cache.get_or_compute(1);
+        ASSERT_TRUE(r.is_positive());
+        ASSERT_EQ(*r.value(), 10);
+      });
+
+      t1.join();
+      t2.join();
+
+      // After the race, ensure entry is consistent
+      auto r = cache.get_or_compute(1);
+      ASSERT_TRUE(r.is_positive());
+      ASSERT_EQ(*r.value(), 10);
+    }
+}

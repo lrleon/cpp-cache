@@ -414,3 +414,93 @@ TEST(StressTest, random_keys_random_delays)
       ASSERT_NE(r.value(), nullptr);
     }
 }
+
+// ================================================================
+// Variadic args under concurrency
+// ================================================================
+
+TEST(ConcurrentVariadicTest, single_flight_with_extra_args)
+{
+  atomic<int> solver_calls{0};
+
+  using VariadicCache = Cache<int, int, std::equal_to<int>, string>;
+
+  VariadicCache cache(
+    5, 20s, 1s,
+    [&](const int &key, string) -> shared_ptr<int>
+    {
+      solver_calls.fetch_add(1);
+      this_thread::sleep_for(300ms);
+      return make_shared<int>(key * 10);
+    });
+
+  constexpr int N = 10;
+  vector<thread> threads;
+  vector<shared_ptr<int>> results(N);
+
+  for (int i = 0; i < N; ++i)
+    threads.emplace_back([&, i]()
+    {
+      auto r = cache.get_or_compute(1, string("arg"));
+      results[i] = r.value();
+    });
+
+  for (auto &t : threads)
+    t.join();
+
+  for (int i = 0; i < N; ++i)
+    {
+      ASSERT_NE(results[i], nullptr);
+      ASSERT_EQ(*results[i], 10);
+    }
+
+  // All should point to same object (single-flight)
+  for (int i = 1; i < N; ++i)
+    ASSERT_EQ(results[0].get(), results[i].get());
+
+  // Solver called exactly once
+  ASSERT_EQ(solver_calls.load(), 1);
+}
+
+// ================================================================
+// get() simplified API under concurrency
+// ================================================================
+
+TEST(ConcurrentGetApiTest, get_returns_same_pointer)
+{
+  atomic<int> solver_calls{0};
+
+  Cache<int, int> cache(5, 20s, 1s,
+    [&](const int &key) -> shared_ptr<int>
+    {
+      solver_calls.fetch_add(1);
+      this_thread::sleep_for(300ms);
+      return make_shared<int>(key * 10);
+    });
+
+  constexpr int N = 15;
+  vector<future<shared_ptr<int>>> futures;
+
+  for (int i = 0; i < N; ++i)
+    futures.push_back(async(launch::async, [&]()
+    {
+      return cache.get(1);
+    }));
+
+  vector<shared_ptr<int>> results;
+  for (auto &f : futures)
+    results.push_back(f.get());
+
+  // All results should be valid
+  for (auto &r : results)
+    {
+      ASSERT_NE(r, nullptr);
+      ASSERT_EQ(*r, 10);
+    }
+
+  // All should point to the same object (single-flight)
+  for (size_t i = 1; i < results.size(); ++i)
+    ASSERT_EQ(results[0].get(), results[i].get());
+
+  ASSERT_EQ(solver_calls.load(), 1);
+}

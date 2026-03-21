@@ -71,7 +71,7 @@ struct CacheStats
  * @tparam Value The type of cached data. Managed via std::shared_ptr for safe lifetime.
  * @tparam Cmp Equality comparator for keys (default: std::equal_to<Key>).
  */
-template <typename Key, typename Value, typename Cmp = std::equal_to<Key>>
+template <typename Key, typename Value, typename Cmp = std::equal_to<Key>, typename... Args>
 class Cache
 {
 public:
@@ -81,7 +81,7 @@ public:
    * Receives a key and returns a shared_ptr<Value>.
    * If the solver returns nullptr, it is considered a cacheable failure.
    */
-  using MissSolver = std::function<std::shared_ptr<Value>(const Key &)>;
+  using MissSolver = std::function<std::shared_ptr<Value>(const Key &, Args...)>;
 
   /** @brief Type for key hashing function. */
   using HashFct = std::function<size_t(const Key &)>;
@@ -256,7 +256,12 @@ private:
 
   MissSolver _solver; /**< User-provided callback to fetch missing values. */
 
-  CacheStats _stats; /**< Thread-safe statistics (requires _mtx for updates). */
+  std::atomic<size_t> _stat_hits{0};
+  std::atomic<size_t> _stat_misses{0};
+  std::atomic<size_t> _stat_negative_hits{0};
+  std::atomic<size_t> _stat_evictions{0};
+  std::atomic<size_t> _stat_saturations{0};
+
   std::atomic<size_t> _computing_count{0}; /**< Fast track for saturation check (audit fix 3.4). */
 
   // ================================================================
@@ -323,7 +328,7 @@ private:
   {
     lru_remove(entry);
     _table.remove(entry);
-    ++_stats.evictions;
+    _stat_evictions.fetch_add(1, std::memory_order_relaxed);
     if (entry->release())
       delete entry;
   }
@@ -481,18 +486,17 @@ private:
         // Refresh TTL on hit (fixes audit design issue 4.1)
         entry->set_expiration(std::chrono::steady_clock::now() + _positive_ttl);
 
-        std::scoped_lock glock(_mtx);
-        ++_stats.hits;
+        _stat_hits.fetch_add(1, std::memory_order_relaxed);
         return CacheResult<Value>::hit_positive(entry->value());
       }
 
     if (entry->state() == EntryState::Failed)
       {
-        std::scoped_lock glock(_mtx);
-        ++_stats.negative_hits;
+        entry->set_expiration(std::chrono::steady_clock::now() + _negative_ttl);
+
+        _stat_negative_hits.fetch_add(1, std::memory_order_relaxed);
         return CacheResult<Value>::hit_negative();
       }
-
     // Edge case: entry was invalidated or reset while we were waiting.
     return std::nullopt;
   }
@@ -505,7 +509,8 @@ private:
    */
   CacheResult<Value> resolve_miss(CacheEntry *entry,
                                   const std::chrono::steady_clock::time_point &now,
-                                  const bool owner = false)
+                                  const bool owner,
+                                  Args... args)
   {
     std::unique_lock entry_lock(entry->mtx());
 
@@ -553,7 +558,7 @@ private:
       {
         // Run user code without holding any mutexes to avoid deadlocks
         // and allow maximum concurrency.
-        result = _solver(entry->key());
+        result = _solver(entry->key(), std::forward<Args>(args)...);
         solver_succeeded = (result != nullptr);
       }
     catch (...)
@@ -598,8 +603,8 @@ private:
     {
       std::scoped_lock glock(_mtx);
       lru_move_to_mru(entry);
-      ++_stats.misses;
     }
+    _stat_misses.fetch_add(1, std::memory_order_relaxed);
 
     return cache_result;
   }
@@ -634,6 +639,17 @@ public:
     _table.set_hash_fct(std::move(hash_fct));
   }
 
+  /**
+   * @brief Destructor.
+   *
+   * @warning The Cache must not be destroyed while any thread is calling
+   * get_or_compute(), find(), or any other member function. Destroying
+   * the cache during active operations results in undefined behavior.
+   * The caller is responsible for ensuring all operations have completed
+   * (e.g., via thread join or barrier) before destruction.
+   */
+  ~Cache() = default;
+
   /// @name Non-copyable/Non-movable
   /// Cache contains mutexes and condition variables which are not copyable or movable.
   /// @{
@@ -654,9 +670,10 @@ public:
    * Ensures that for any given key, only one solver is running at a time.
    *
    * @param key The key to look up.
+   * @param args Additional arguments to pass to the miss solver if computation is needed.
    * @return A CacheResult containing the value or failure status.
    */
-  CacheResult<Value> get_or_compute(const Key &key)
+  CacheResult<Value> get_or_compute(const Key &key, Args... args)
   {
     std::pair<CacheEntry *, bool> p;
     {
@@ -671,10 +688,7 @@ public:
     if (entry == nullptr)
       {
         // Handle cache saturation: all slots are busy with long-running computations.
-        {
-          std::scoped_lock glock(_mtx);
-          ++_stats.saturations;
-        }
+        _stat_saturations.fetch_add(1, std::memory_order_relaxed);
         return CacheResult<Value>::saturated();
       }
 
@@ -695,7 +709,23 @@ public:
     // For new entries (!existed): we are the owner — entry is already Computing
     // (set in contains_or_insert_locked under global lock).
     // For expired entries (existed): entry was reset to Empty by resolve_hit.
-    return resolve_miss(entry, now, !existed);
+    return resolve_miss(entry, now, !existed, std::forward<Args>(args)...);
+  }
+
+  /**
+   * @brief Simplified API that returns only the value (nullable).
+   *
+   * Invokes get_or_compute internally but discards the origin metadata.
+   * This is the recommended method for standard usage where telemetry is not needed.
+   *
+   * @param key The key to look up.
+   * @param args Optional arguments to forward to the miss solver.
+   * @return A valid shared_ptr if the result is positive, or nullptr if the result
+   *         is negative, failed, or the cache is saturated.
+   */
+  std::shared_ptr<Value> get(const Key &key, Args... args)
+  {
+    return get_or_compute(key, std::forward<Args>(args)...).value();
   }
 
   /**
@@ -751,6 +781,9 @@ public:
 
     if (entry->state() == EntryState::Failed)
       {
+        // Refresh TTL on hit for negative values too
+        entry->set_expiration(std::chrono::steady_clock::now() + _negative_ttl);
+
         std::scoped_lock glock(_mtx);
         lru_move_to_mru(entry);
         return CacheResult<Value>::hit_negative();
@@ -886,8 +919,13 @@ public:
   /** @brief Returns a snapshot of the cache statistics. */
   CacheStats stats() const
   {
-    std::scoped_lock glock(const_cast<std::mutex &>(_mtx));
-    return _stats;
+    return CacheStats{
+      _stat_hits.load(std::memory_order_relaxed),
+      _stat_misses.load(std::memory_order_relaxed),
+      _stat_negative_hits.load(std::memory_order_relaxed),
+      _stat_evictions.load(std::memory_order_relaxed),
+      _stat_saturations.load(std::memory_order_relaxed)
+    };
   }
 
 };  // end class Cache

@@ -813,3 +813,44 @@ TEST(ComplexKeyTest, pair_keys)
   auto r3 = cache.get_or_compute({1, 2});
   EXPECT_TRUE(r3.is_hit());
 }
+
+// ================================================================
+// Section 14: find() TTL refresh for negative entries
+// ================================================================
+
+TEST(FindNegativeTTLTest, find_on_failed_entry_refreshes_ttl)
+{
+  Cache<int, int> cache(5, 10s, 2s,
+    [](const int &) -> shared_ptr<int> { return nullptr; });
+
+  // Cache a negative result (negative TTL = 2s)
+  cache.get_or_compute(1);
+
+  // Wait for more than half the negative TTL
+  this_thread::sleep_for(1200ms);
+
+  // find() should return the negative hit and refresh the TTL
+  auto r = cache.find(1);
+  ASSERT_TRUE(r.has_value());
+  ASSERT_TRUE(r->is_negative());
+  ASSERT_TRUE(r->is_hit());
+
+  // Wait another 1.2s. Total since insert: 2.4s (> 2s original TTL).
+  // But find() refreshed it, so the new TTL expires 2s from find() call.
+  this_thread::sleep_for(1200ms);
+
+  // Should still be valid because find() refreshed the 2s TTL
+  auto r2 = cache.find(1);
+  EXPECT_TRUE(r2.has_value())
+    << "find() on Failed entry should refresh negative TTL";
+  EXPECT_TRUE(r2->is_negative());
+
+  // Wait for the refreshed TTL to finally expire
+  this_thread::sleep_for(1000ms);
+
+  // Now it should be gone (second refresh would need another find() call)
+  this_thread::sleep_for(1100ms);
+
+  EXPECT_FALSE(cache.find(1).has_value())
+    << "Negative entry should eventually expire after last access";
+}
