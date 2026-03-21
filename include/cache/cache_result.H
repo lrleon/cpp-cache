@@ -130,6 +130,9 @@ public:
   /**
    * @brief Returns the cached value.
    * @return A shared_ptr to the value (non-null only if is_positive() is true).
+   * @warning If multiple threads access this value concurrently and mutate it,
+   * the user must ensure the Value type is thread-safe. The cache does not
+   * protect against data races on the Value itself.
    */
   const std::shared_ptr<Value> &value() const noexcept
   {

@@ -11,7 +11,7 @@
 // - Never evicts entries in Computing state
 // - Uses LRU eviction policy
 //
-// Reuses Aleph-w: OLhashTable for hash table, Dlink for LRU list
+// Reuses Aleph-w: LhashTableVtl for hash table, Dlink for LRU list
 //
 
 #ifndef CACHE_CACHE_H
@@ -28,7 +28,7 @@
 
 #include <aleph.H>
 #include <dlink.H>
-#include <tpl_olhash.H>
+#include <tpl_lhash.H>
 
 #include <cache/cache_result.H>
 #include <cache/entry_state.H>
@@ -61,6 +61,12 @@ struct CacheStats
  * - **Thread-Safe:** Uses a combination of a global mutex for structural changes and
  *   per-entry mutexes for fine-grained coordination.
  *
+ * @warning **Value Thread-Safety Responsibility:** The cache stores values via `shared_ptr<Value>`,
+ * which can be accessed concurrently by multiple threads. If `Value` is mutable, the user must ensure
+ * thread-safety either by: (1) making `Value` internally thread-safe (e.g., with internal mutexes),
+ * or (2) treating it as immutable after caching. The cache does NOT protect against data races on
+ * the `Value` itself—only the cache structure is thread-safe.
+ *
  * @tparam Key The type used for lookup. Must be equality-comparable and hashable.
  * @tparam Value The type of cached data. Managed via std::shared_ptr for safe lifetime.
  * @tparam Cmp Equality comparator for keys (default: std::equal_to<Key>).
@@ -88,11 +94,12 @@ private:
    * This design allows concurrent access to different keys while ensuring that
    * multiple requests for the *same* key wait for a single computation.
    */
-  class CacheEntry
+  class CacheEntry : public Aleph::LhashBucketVtl<Key>
   {
     friend class Cache;
 
-    Key _key = Key();
+    using BucketBase = Aleph::LhashBucketVtl<Key>;
+
     std::shared_ptr<Value> _value;
     EntryState _state = EntryState::Empty;
 
@@ -111,58 +118,46 @@ private:
 
     std::chrono::time_point<std::chrono::steady_clock> _expiration;
 
+    /**
+     * @brief Reference count for safe pointer lifetime across lock boundaries.
+     *
+     * Starts at 1 (table ownership). Incremented when a thread acquires a
+     * pointer under _mtx, decremented when done. Entry is deleted when the
+     * count reaches zero. This eliminates the TOCTOU window where an entry
+     * could be evicted while a thread operates on it without _mtx held.
+     */
+    std::atomic<unsigned> _refcount{1};
+
   public:
-    CacheEntry() = default;
+    CacheEntry() = delete;
 
-    explicit CacheEntry(const Key &k) : _key(k) {}
+    explicit CacheEntry(const Key &k) : BucketBase(k) {}
 
-    explicit CacheEntry(Key &&k) : _key(std::move(k)) {}
+    explicit CacheEntry(Key &&k) : BucketBase(std::move(k)) {}
 
-    CacheEntry(const CacheEntry &other)
-      : _key(other._key), _value(other._value), _state(other._state), _expiration(other._expiration)
+    // Non-copyable, non-movable (contains mutex, cv, atomic refcount)
+    CacheEntry(const CacheEntry &) = delete;
+    CacheEntry &operator=(const CacheEntry &) = delete;
+    CacheEntry(CacheEntry &&) = delete;
+    CacheEntry &operator=(CacheEntry &&) = delete;
+
+    ~CacheEntry() override = default;
+
+    /** @brief Increment refcount (must be called under _mtx). */
+    void acquire() noexcept
     {
-      // mutex and cv are not copyable; Dlink default-constructed
+      _refcount.fetch_add(1, std::memory_order_relaxed);
     }
 
-    CacheEntry(CacheEntry &&other) noexcept
-      : _key(std::move(other._key)), _value(std::move(other._value)), _state(other._state),
-        _expiration(other._expiration)
+    /** @brief Decrement refcount. Returns true if it reached zero (caller must delete). */
+    bool release() noexcept
     {
-      // empty
-    }
-
-    CacheEntry &operator=(const CacheEntry &other)
-    {
-      if (this != &other)
-        {
-          _key = other._key;
-          _value = other._value;
-          _state = other._state;
-          _expiration = other._expiration;
-        }
-      return *this;
-    }
-
-    CacheEntry &operator=(CacheEntry &&other) noexcept
-    {
-      if (this != &other)
-        {
-          _key = std::move(other._key);
-          _value = std::move(other._value);
-          _state = other._state;
-          _expiration = other._expiration;
-        }
-      return *this;
-    }
-
-    bool operator==(const CacheEntry &other) const
-    {
-      return Cmp()(_key, other._key);
+      return _refcount.fetch_sub(1, std::memory_order_acq_rel) == 1;
     }
 
     const Key &key() const noexcept
     {
-      return _key;
+      return this->get_key();
     }
 
     Dlink *link_lru() noexcept
@@ -215,34 +210,7 @@ private:
       _expiration = exp;
     }
 
-    // Reset entry to Empty state for reuse
-    void reset() noexcept
-    {
-      _state = EntryState::Empty;
-      _value.reset();
-    }
-
-    void swap(CacheEntry &other) noexcept
-    {
-      using std::swap;
-      swap(_key, other._key);
-      swap(_value, other._value);
-      swap(_state, other._state);
-      swap(_expiration, other._expiration);
-    }
-
   };  // end class CacheEntry
-
-  // ================================================================
-  // Comparator adapter for hash table
-  // ================================================================
-  struct EntryCmp
-  {
-    bool operator()(const CacheEntry &a, const CacheEntry &b) const
-    {
-      return Cmp()(a.key(), b.key());
-    }
-  };
 
   // ================================================================
   // Data members
@@ -251,8 +219,24 @@ private:
   Dlink _lru_list;   /**< Sentinel for the LRU list (head is MRU, tail is LRU). */
   size_t _capacity;  /**< Maximum number of entries allowed. */
 
-  using HashTable = OLhashTable<CacheEntry, EntryCmp>;
+  using HashTable = Aleph::LhashTableVtl<Key, Cmp>;
+  using Bucket = typename HashTable::Bucket;
   HashTable _table;  /**< Hash table for O(1) key lookups. */
+
+  /**
+   * @brief RAII guard that releases an entry's refcount on scope exit.
+   *
+   * If the refcount reaches zero, the entry is deleted. This ensures
+   * entries outlive any thread operating on them even after eviction.
+   */
+  struct EntryGuard
+  {
+    CacheEntry *entry;
+    explicit EntryGuard(CacheEntry *e) noexcept : entry(e) {}
+    ~EntryGuard() { if (entry and entry->release()) delete entry; }
+    EntryGuard(const EntryGuard &) = delete;
+    EntryGuard &operator=(const EntryGuard &) = delete;
+  };
 
   std::chrono::seconds _positive_ttl; /**< Validity duration for successful results. */
   std::chrono::seconds _negative_ttl; /**< Validity duration for failed results. */
@@ -327,27 +311,40 @@ private:
 
   /**
    * @brief Remove entry from hash table and LRU list.
+   *
+   * Releases the table's ownership reference. If no thread holds
+   * an active reference, the entry is deleted immediately.
+   *
    * @note Requires _mtx to be held by the caller.
    */
   void remove_entry(CacheEntry *entry)
   {
     lru_remove(entry);
-    entry->reset();
-    _table.remove(*entry);
+    _table.remove(entry);
     ++_stats.evictions;
+    if (entry->release())
+      delete entry;
   }
 
   // ================================================================
-  // Hash table adapter
+  // Hash table helpers
   // ================================================================
 
-  // Wraps a Key hash function into a CacheEntry hash function
-  static typename HashTable::Hash_Fct make_entry_hash(HashFct key_hash)
+  /** @brief Cast a table bucket to CacheEntry. */
+  static CacheEntry *to_entry(Bucket *bucket) noexcept
   {
-    return [key_hash = std::move(key_hash)](const CacheEntry &entry) -> size_t
-    {
-      return key_hash(entry.key());
-    };
+    return static_cast<CacheEntry *>(bucket);
+  }
+
+  /**
+   * @brief Search by key — no temporary CacheEntry construction needed.
+   *
+   * This eliminates the audit bug 3.1 pattern where a temporary CacheEntry
+   * (with its mutex and condition_variable) was constructed just for lookup.
+   */
+  CacheEntry *search_entry(const Key &key) const
+  {
+    return to_entry(_table.search(key));
   }
 
   // Default hash function for Key using Aleph's dft_hash_fct
@@ -356,10 +353,15 @@ private:
     return Aleph::dft_hash_fct(key);
   }
 
+  // Placeholder hash for constructor — immediately replaced by set_hash_fct.
+  // Avoids instantiating dft_hash_ptr_fct<Key> for types without Aleph hashing.
+  static size_t placeholder_hash(const Key &) noexcept { return 0; }
+
   /**
    * @brief High-level lookup/insertion logic with eviction support.
    *
    * This is the only place where the cache structure (hash table and LRU) is modified.
+   * The returned entry has its refcount incremented for the caller.
    *
    * @param key The key to find or reserve.
    * @return {entry_ptr, existed} where existed=true means the key was already present.
@@ -370,12 +372,12 @@ private:
   {
     assert(_table.size() <= _capacity);
 
-    // First try: the key might already be in the table
-    CacheEntry *existing = _table.search(CacheEntry(key));
+    // Search by key — no temporary CacheEntry needed (fixes audit bug 3.1)
+    CacheEntry *existing = search_entry(key);
     if (existing != nullptr)
       {
-        // On hit, we move it to MRU to refresh its LRU priority
         lru_move_to_mru(existing);
+        existing->acquire();
         return {existing, true};
       }
 
@@ -394,21 +396,25 @@ private:
 
     assert(_table.size() < _capacity);
 
-    // Reserve the slot in the hash table
-    auto [entry_ptr, existed] = _table.contains_or_insert(CacheEntry(key));
+    // Heap-allocate the new entry (refcount starts at 1 for table ownership)
+    auto *entry = new CacheEntry(key);
+    auto *inserted = _table.insert(entry);
 
-    if (entry_ptr == nullptr)
-      return {nullptr, false};  // Hash table internal failure (e.g. out of memory)
-
-    // Should not already exist as we searched for it just above
-    assert(not existed);
+    if (inserted == nullptr)
+      {
+        delete entry;
+        return {nullptr, false};
+      }
 
     // Mark as Computing immediately so the entry is never evictable
     // between insertion and the solver run (fixes audit bug 1.1).
-    entry_ptr->set_state(EntryState::Computing);
+    entry->set_state(EntryState::Computing);
 
-    lru_insert_as_mru(entry_ptr);
-    return {entry_ptr, false};
+    // Acquire for caller (refcount: 1 table + 1 caller = 2)
+    entry->acquire();
+
+    lru_insert_as_mru(entry);
+    return {entry, false};
   }
 
   /**
@@ -600,15 +606,18 @@ public:
         const std::chrono::seconds &negative_ttl,
         MissSolver solver,
         HashFct hash_fct = default_key_hash)
-    : _capacity(capacity), _table(static_cast<size_t>(table_ratio * capacity),
-                                  make_entry_hash(hash_fct),
-                                  EntryCmp(),
-                                  hash_default_lower_alpha,
-                                  hash_default_upper_alpha,
-                                  false),
+    : _capacity(capacity),
+      _table(static_cast<size_t>(table_ratio * capacity),
+             placeholder_hash,
+             Cmp(),
+             0.0f,    // lower_alpha — never shrink
+             10.0f,   // upper_alpha — effectively disable resize trigger
+             true,    // remove_all_buckets — table deletes remaining entries
+             false),  // with_resize — preallocated, no dynamic resize
       _positive_ttl(positive_ttl), _negative_ttl(negative_ttl), _solver(std::move(solver))
   {
     assert(capacity > 0);
+    _table.set_hash_fct(std::move(hash_fct));
   }
 
   /// @name Non-copyable/Non-movable
@@ -655,6 +664,11 @@ public:
         return CacheResult<Value>::saturated();
       }
 
+    // RAII guard releases caller's refcount when this method returns.
+    // If the entry was evicted while we operated on it, the guard
+    // will delete it once no other thread holds a reference.
+    EntryGuard guard(entry);
+
     const auto now = std::chrono::steady_clock::now();
 
     if (existed)
@@ -685,13 +699,16 @@ public:
     CacheEntry *entry;
     {
       std::scoped_lock glock(_mtx);
-      entry = _table.search(CacheEntry(key));
+      entry = search_entry(key);
       if (entry == nullptr)
         return std::nullopt;
       // Do NOT move to MRU here: we must first confirm the entry is
       // valid. Moving unconditionally would undo invalidate()'s LRU
       // tail placement and allow stale entries to survive eviction.
+      entry->acquire();
     }
+
+    EntryGuard guard(entry);
 
     const auto now = std::chrono::steady_clock::now();
     std::unique_lock entry_lock(entry->mtx());
@@ -741,10 +758,13 @@ public:
     CacheEntry *entry;
     {
       std::scoped_lock glock(_mtx);
-      entry = _table.search(CacheEntry(key));
+      entry = search_entry(key);
       if (entry == nullptr)
         return false;
+      entry->acquire();
     }
+
+    EntryGuard guard(entry);
 
     std::scoped_lock entry_lock(entry->mtx());
 
@@ -780,10 +800,13 @@ public:
     CacheEntry *entry;
     {
       std::scoped_lock glock(_mtx);
-      entry = _table.search(CacheEntry(key));
+      entry = search_entry(key);
       if (entry == nullptr)
         return false;
+      entry->acquire();
     }
+
+    EntryGuard guard(entry);
 
     auto now = std::chrono::steady_clock::now();
     std::scoped_lock entry_lock(entry->mtx());
@@ -814,10 +837,13 @@ public:
     CacheEntry *entry;
     {
       std::scoped_lock glock(_mtx);
-      entry = _table.search(CacheEntry(key));
+      entry = search_entry(key);
       if (entry == nullptr)
         return false;
+      entry->acquire();
     }
+
+    EntryGuard guard(entry);
 
     auto now = std::chrono::steady_clock::now();
     std::scoped_lock entry_lock(entry->mtx());
