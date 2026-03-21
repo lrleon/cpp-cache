@@ -390,7 +390,7 @@ private:
     if (_table.size() == _capacity)
       {
         if (_computing_count >= _capacity)
-          return {nullptr, false}; // Fast path: avoid O(n) scan when fully saturated (audit fix 3.4)
+          return {nullptr, false};  // Fast path: avoid O(n) scan when fully saturated (audit fix 3.4)
 
         CacheEntry *victim = find_evictable_lru();
         if (victim == nullptr)
@@ -469,13 +469,11 @@ private:
 
     // Single-flight: if another thread is already computing, wait for it.
     if (entry->state() == EntryState::Computing)
+      entry->cv().wait(entry_lock,
+                       [entry]
       {
-        entry->cv().wait(entry_lock,
-                         [entry]
-        {
-          return entry->state() != EntryState::Computing;
-        });
-      }
+        return entry->state() != EntryState::Computing;
+      });
 
     // Now that computation is finished (or was already finished), check outcome.
     if (entry->state() == EntryState::Ready)
@@ -507,7 +505,7 @@ private:
    */
   CacheResult<Value> resolve_miss(CacheEntry *entry,
                                   const std::chrono::steady_clock::time_point &now,
-                                  bool owner = false)
+                                  const bool owner = false)
   {
     std::unique_lock entry_lock(entry->mtx());
 
@@ -735,13 +733,11 @@ public:
 
     // Wait for ongoing computations (single-flight semantics)
     if (entry->state() == EntryState::Computing)
+      entry->cv().wait(entry_lock,
+                       [entry]
       {
-        entry->cv().wait(entry_lock,
-                         [entry]
-        {
-          return entry->state() != EntryState::Computing;
-        });
-      }
+        return entry->state() != EntryState::Computing;
+      });
 
     if (entry->state() == EntryState::Ready)
       {
