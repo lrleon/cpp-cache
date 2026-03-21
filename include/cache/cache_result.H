@@ -94,13 +94,13 @@ public:
   /** @brief Returns true if the result contains a positive value. */
   [[nodiscard]] bool is_positive() const noexcept
   {
-    return _origin == ResultOrigin::HitPositive || _origin == ResultOrigin::ComputedPositive;
+    return _origin == ResultOrigin::HitPositive or _origin == ResultOrigin::ComputedPositive;
   }
 
   /** @brief Returns true if the result represents a cached failure/negative. */
   [[nodiscard]] bool is_negative() const noexcept
   {
-    return _origin == ResultOrigin::HitNegative || _origin == ResultOrigin::ComputedNegative;
+    return _origin == ResultOrigin::HitNegative or _origin == ResultOrigin::ComputedNegative;
   }
 
   /** @brief Returns true if the cache was saturated (full of computing entries). */
@@ -112,13 +112,13 @@ public:
   /** @brief Returns true if the result was a cache hit (positive or negative). */
   [[nodiscard]] bool is_hit() const noexcept
   {
-    return _origin == ResultOrigin::HitPositive || _origin == ResultOrigin::HitNegative;
+    return _origin == ResultOrigin::HitPositive or _origin == ResultOrigin::HitNegative;
   }
 
   /** @brief Returns true if the result was computed during the current call. */
   [[nodiscard]] bool was_computed() const noexcept
   {
-    return _origin == ResultOrigin::ComputedPositive || _origin == ResultOrigin::ComputedNegative;
+    return _origin == ResultOrigin::ComputedPositive or _origin == ResultOrigin::ComputedNegative;
   }
 
   /** @brief Returns the internal origin of the result. */

@@ -40,11 +40,11 @@ namespace CppCache {
  */
 struct CacheStats
 {
-  size_t hits = 0;           /**< Successful lookups found in cache. */
-  size_t misses = 0;         /**< Lookups that required computing the value. */
-  size_t negative_hits = 0;  /**< Successful lookups of previously cached failures. */
-  size_t evictions = 0;      /**< Number of entries evicted by LRU policy. */
-  size_t saturations = 0;    /**< Failures due to all entries being in Computing state. */
+  size_t hits = 0;          /**< Successful lookups found in cache. */
+  size_t misses = 0;        /**< Lookups that required computing the value. */
+  size_t negative_hits = 0; /**< Successful lookups of previously cached failures. */
+  size_t evictions = 0;     /**< Number of entries evicted by LRU policy. */
+  size_t saturations = 0;   /**< Failures due to all entries being in Computing state. */
 };
 
 /**
@@ -62,10 +62,10 @@ struct CacheStats
  *   per-entry mutexes for fine-grained coordination.
  *
  * @warning **Value Thread-Safety Responsibility:** The cache stores values via `shared_ptr<Value>`,
- * which can be accessed concurrently by multiple threads. If `Value` is mutable, the user must ensure
- * thread-safety either by: (1) making `Value` internally thread-safe (e.g., with internal mutexes),
- * or (2) treating it as immutable after caching. The cache does NOT protect against data races on
- * the `Value` itself—only the cache structure is thread-safe.
+ * which can be accessed concurrently by multiple threads. If `Value` is mutable, the user must
+ * ensure thread-safety either by: (1) making `Value` internally thread-safe (e.g., with internal
+ * mutexes), or (2) treating it as immutable after caching. The cache does NOT protect against data
+ * races on the `Value` itself—only the cache structure is thread-safe.
  *
  * @tparam Key The type used for lookup. Must be equality-comparable and hashable.
  * @tparam Value The type of cached data. Managed via std::shared_ptr for safe lifetime.
@@ -103,7 +103,7 @@ private:
     std::shared_ptr<Value> _value;
     EntryState _state = EntryState::Empty;
 
-    Dlink _dlink_lru;  /**< Embedded link for the LRU doubly-linked list. */
+    Dlink _dlink_lru; /**< Embedded link for the LRU doubly-linked list. */
 
     /**
      * @brief Protects the entry state and value during state transitions.
@@ -216,12 +216,12 @@ private:
   // Data members
   // ================================================================
 
-  Dlink _lru_list;   /**< Sentinel for the LRU list (head is MRU, tail is LRU). */
-  size_t _capacity;  /**< Maximum number of entries allowed. */
+  Dlink _lru_list;  /**< Sentinel for the LRU list (head is MRU, tail is LRU). */
+  size_t _capacity; /**< Maximum number of entries allowed. */
 
   using HashTable = Aleph::LhashTableVtl<Key, Cmp>;
   using Bucket = typename HashTable::Bucket;
-  HashTable _table;  /**< Hash table for O(1) key lookups. */
+  HashTable _table; /**< Hash table for O(1) key lookups. */
 
   /**
    * @brief RAII guard that releases an entry's refcount on scope exit.
@@ -233,7 +233,11 @@ private:
   {
     CacheEntry *entry;
     explicit EntryGuard(CacheEntry *e) noexcept : entry(e) {}
-    ~EntryGuard() { if (entry and entry->release()) delete entry; }
+    ~EntryGuard()
+    {
+      if (entry and entry->release())
+        delete entry;
+    }
     EntryGuard(const EntryGuard &) = delete;
     EntryGuard &operator=(const EntryGuard &) = delete;
   };
@@ -252,7 +256,8 @@ private:
 
   MissSolver _solver; /**< User-provided callback to fetch missing values. */
 
-  CacheStats _stats;  /**< Thread-safe statistics (requires _mtx for updates). */
+  CacheStats _stats; /**< Thread-safe statistics (requires _mtx for updates). */
+  std::atomic<size_t> _computing_count{0}; /**< Fast track for saturation check (audit fix 3.4). */
 
   // ================================================================
   // LRU helpers (must be called with _mtx held)
@@ -301,11 +306,8 @@ private:
   CacheEntry *find_evictable_lru() const
   {
     for (Dlink *p = _lru_list.get_prev(); p != const_cast<Dlink *>(&_lru_list); p = p->get_prev())
-      {
-        CacheEntry *entry = _dlink_lru_to_CacheEntry(p);
-        if (entry->state() != EntryState::Computing)
-          return entry;
-      }
+      if (CacheEntry *entry = _dlink_lru_to_CacheEntry(p); entry->state() != EntryState::Computing)
+        return entry;
     return nullptr;
   }
 
@@ -355,7 +357,10 @@ private:
 
   // Placeholder hash for constructor — immediately replaced by set_hash_fct.
   // Avoids instantiating dft_hash_ptr_fct<Key> for types without Aleph hashing.
-  static size_t placeholder_hash(const Key &) noexcept { return 0; }
+  static size_t placeholder_hash(const Key &) noexcept
+  {
+    return 0;
+  }
 
   /**
    * @brief High-level lookup/insertion logic with eviction support.
@@ -384,6 +389,9 @@ private:
     // Key not found -- we need to insert. Evict first if at capacity.
     if (_table.size() == _capacity)
       {
+        if (_computing_count >= _capacity)
+          return {nullptr, false}; // Fast path: avoid O(n) scan when fully saturated (audit fix 3.4)
+
         CacheEntry *victim = find_evictable_lru();
         if (victim == nullptr)
           {
@@ -409,6 +417,7 @@ private:
     // Mark as Computing immediately so the entry is never evictable
     // between insertion and the solver run (fixes audit bug 1.1).
     entry->set_state(EntryState::Computing);
+    ++_computing_count;
 
     // Acquire for caller (refcount: 1 table + 1 caller = 2)
     entry->acquire();
@@ -471,6 +480,9 @@ private:
     // Now that computation is finished (or was already finished), check outcome.
     if (entry->state() == EntryState::Ready)
       {
+        // Refresh TTL on hit (fixes audit design issue 4.1)
+        entry->set_expiration(std::chrono::steady_clock::now() + _positive_ttl);
+
         std::scoped_lock glock(_mtx);
         ++_stats.hits;
         return CacheResult<Value>::hit_positive(entry->value());
@@ -530,6 +542,7 @@ private:
         // We are the winning thread: mark as Computing and release lock before calling solver.
         // Releasing the lock is vital to allow other threads to access other keys.
         entry->set_state(EntryState::Computing);
+        ++_computing_count;
       }
 
     // owner == true: entry is already Computing (set in contains_or_insert_locked
@@ -574,6 +587,13 @@ private:
         entry->set_expiration(completion_time + _negative_ttl);
       }
 
+    --_computing_count;
+
+    // Signal all waiting threads that the value is now available.
+    // Done while holding the entry lock to ensure waiters wake up immediately
+    // after unlock, without being delayed by the global _mtx acquisition (audit fix 3.2).
+    entry->cv().notify_all();
+
     entry_lock.unlock();
 
     // Structural update: move the refreshed/new entry to MRU position.
@@ -582,9 +602,6 @@ private:
       lru_move_to_mru(entry);
       ++_stats.misses;
     }
-
-    // Signal all waiting threads that the value is now available.
-    entry->cv().notify_all();
 
     return cache_result;
   }
@@ -606,14 +623,13 @@ public:
         const std::chrono::seconds &negative_ttl,
         MissSolver solver,
         HashFct hash_fct = default_key_hash)
-    : _capacity(capacity),
-      _table(static_cast<size_t>(table_ratio * capacity),
-             placeholder_hash,
-             Cmp(),
-             0.0f,    // lower_alpha — never shrink
-             10.0f,   // upper_alpha — effectively disable resize trigger
-             true,    // remove_all_buckets — table deletes remaining entries
-             false),  // with_resize — preallocated, no dynamic resize
+    : _capacity(capacity), _table(static_cast<size_t>(table_ratio * capacity),
+                                  placeholder_hash,
+                                  Cmp(),
+                                  0.0f,    // lower_alpha — never shrink
+                                  10.0f,   // upper_alpha — effectively disable resize trigger
+                                  true,    // remove_all_buckets — table deletes remaining entries
+                                  false),  // with_resize — preallocated, no dynamic resize
       _positive_ttl(positive_ttl), _negative_ttl(negative_ttl), _solver(std::move(solver))
   {
     assert(capacity > 0);
@@ -729,6 +745,9 @@ public:
 
     if (entry->state() == EntryState::Ready)
       {
+        // Refresh TTL on hit (fixes audit design issue 4.1)
+        entry->set_expiration(std::chrono::steady_clock::now() + _positive_ttl);
+
         std::scoped_lock glock(_mtx);
         lru_move_to_mru(entry);
         return CacheResult<Value>::hit_positive(entry->value());

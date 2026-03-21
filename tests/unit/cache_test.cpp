@@ -100,6 +100,30 @@ TEST_F(BasicFixture, ttl_expiration)
   ASSERT_EQ(*r2.value(), 10);
 }
 
+TEST_F(BasicFixture, hit_refreshes_ttl)
+{
+  auto r1 = cache.get_or_compute(1);
+  ASSERT_TRUE(r1.is_positive());
+
+  // Wait 1.1s (more than half TTL)
+  this_thread::sleep_for(1100ms);
+
+  // Hit the cache -> should refresh the TTL to full 2s
+  auto r2 = cache.get_or_compute(1);
+  ASSERT_TRUE(r2.is_hit());
+
+  // Wait another 1.1s. Total time since first insertion is 2.2s. 
+  // If TTL was not refreshed, it would be dead.
+  this_thread::sleep_for(1100ms);
+
+  // Should still be valid because the hit refreshed the 2s TTL
+  ASSERT_TRUE(cache.has(1));
+  
+  // Wait enough to finally expire
+  this_thread::sleep_for(1000ms);
+  ASSERT_FALSE(cache.has(1));
+}
+
 TEST_F(BasicFixture, lru_eviction)
 {
   for (int i = 1; i <= 5; ++i)

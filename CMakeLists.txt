@@ -44,3 +44,14 @@ if(SANITIZE)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SAN_FLAGS}")
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${SAN_FLAGS}")
 endif()
+
+# ----------------------------------------------------------------
+# Testing
+# ----------------------------------------------------------------
+include(CTest)
+enable_testing()
+
+add_test(NAME cache_unit_test COMMAND cache_unit_test)
+add_test(NAME cache_concurrency_test COMMAND cache_concurrency_test)
+add_test(NAME cache_hardened_test COMMAND cache_hardened_test)
+add_test(NAME cache_concurrency_hardened_test COMMAND cache_concurrency_hardened_test)

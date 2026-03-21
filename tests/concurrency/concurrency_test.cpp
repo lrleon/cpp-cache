@@ -9,6 +9,7 @@
 # include <chrono>
 # include <atomic>
 # include <mutex>
+# include <random>
 # include <gtest/gtest.h>
 
 # include <cache/cache.H>
@@ -384,7 +385,9 @@ TEST(StressTest, random_keys_random_delays)
   Cache<int, int> cache(100, 10s, 1s,
     [](const int & key) -> shared_ptr<int>
     {
-      this_thread::sleep_for(chrono::milliseconds(10 + rand() % 50));
+      static thread_local std::mt19937 rng(std::random_device{}());
+      std::uniform_int_distribution<int> sleep_dist(10, 59);
+      this_thread::sleep_for(chrono::milliseconds(sleep_dist(rng)));
       return make_shared<int>(key * 10);
     });
 
@@ -395,9 +398,11 @@ TEST(StressTest, random_keys_random_delays)
 
   for (int i = 0; i < NUM_THREADS; ++i)
     {
-      int key = (rand() % NUM_KEYS) + 1;
-      futures.push_back(async(launch::async, [&cache, key]()
+      futures.push_back(async(launch::async, [&cache]()
       {
+        static thread_local std::mt19937 rng(std::random_device{}());
+        std::uniform_int_distribution<int> key_dist(1, NUM_KEYS);
+        int key = key_dist(rng);
         return cache.get_or_compute(key);
       }));
     }
