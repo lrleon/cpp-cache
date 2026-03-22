@@ -9,6 +9,7 @@
 # include <atomic>
 # include <chrono>
 # include <functional>
+# include <future>
 # include <memory>
 # include <string>
 # include <thread>
@@ -410,15 +411,25 @@ TEST(TouchTest, touch_refreshes_ttl)
     << "touch() should refresh TTL, extending the entry's lifetime";
 }
 
-TEST(TouchTest, touch_on_failed_returns_false)
+TEST(TouchTest, touch_on_failed_refreshes_ttl)
 {
-  Cache<int, int> cache(5, 10s, 5s,
+  Cache<int, int> cache(5, 10s, 1s,
     [](const int &) -> shared_ptr<int> { return nullptr; });
 
-  cache.get_or_compute(1); // Failed entry
+  cache.get_or_compute(1); // Failed entry (1s TTL)
 
-  EXPECT_FALSE(cache.touch(1))
-    << "touch() should only work on Ready entries";
+  this_thread::sleep_for(600ms);
+
+  // touch() should now work on Failed entries to extend negative TTL
+  EXPECT_TRUE(cache.touch(1));
+
+  this_thread::sleep_for(600ms);
+
+  // Total time elapsed: 1.2s. Without touch, it would have expired.
+  // With touch, it remains a hit.
+  auto r = cache.get_or_compute(1);
+  EXPECT_TRUE(r.is_negative());
+  EXPECT_TRUE(r.is_hit());
 }
 
 TEST(TouchTest, touch_on_invalidated_returns_false)
@@ -853,4 +864,85 @@ TEST(FindNegativeTTLTest, find_on_failed_entry_refreshes_ttl)
 
   EXPECT_FALSE(cache.find(1).has_value())
     << "Negative entry should eventually expire after last access";
+}
+
+// ================================================================
+// Section 15: find() blocks during Computing (model extension)
+// ================================================================
+
+TEST(FindModelTest, find_blocks_during_compute)
+{
+  atomic<bool> solver_started{false};
+  atomic<bool> solver_can_finish{false};
+
+  Cache<int, int> cache(5, 20s, 5s,
+    [&](const int &key) -> shared_ptr<int>
+    {
+      solver_started.store(true, memory_order_release);
+      while (not solver_can_finish.load(memory_order_acquire))
+        this_thread::sleep_for(10ms);
+      return make_shared<int>(key * 10);
+    });
+
+  // Start computing key 1 in background
+  auto compute_future = async(launch::async, [&]()
+  {
+    return cache.get_or_compute(1);
+  });
+
+  // Wait for solver to start
+  while (not solver_started.load(memory_order_acquire))
+    this_thread::sleep_for(5ms);
+
+  // find(1) should block until computation finishes
+  auto find_future = async(launch::async, [&]()
+  {
+    return cache.find(1);
+  });
+
+  // Give find() time to enter the wait
+  this_thread::sleep_for(50ms);
+
+  // Release solver
+  solver_can_finish.store(true, memory_order_release);
+
+  auto find_result = find_future.get();
+  auto compute_result = compute_future.get();
+
+  ASSERT_TRUE(find_result.has_value())
+    << "find() must return a value after waiting for Computing entry";
+  EXPECT_TRUE(find_result->is_positive());
+  EXPECT_EQ(*find_result->value(), 10);
+  EXPECT_TRUE(compute_result.is_positive());
+}
+
+// ================================================================
+// Section 16: find() returns nullopt after expiry (no recompute)
+// ================================================================
+
+TEST(FindModelTest, find_returns_nullopt_after_expiry)
+{
+  atomic<int> solver_calls{0};
+
+  Cache<int, int> cache(5, 1s, 1s,
+    [&](const int &key) -> shared_ptr<int>
+    {
+      solver_calls.fetch_add(1);
+      return make_shared<int>(key * 10);
+    });
+
+  cache.get_or_compute(1);
+  ASSERT_EQ(solver_calls.load(), 1);
+
+  // Wait for TTL to expire
+  this_thread::sleep_for(1100ms);
+
+  // find() must return nullopt — it never triggers recomputation
+  auto r = cache.find(1);
+  EXPECT_FALSE(r.has_value())
+    << "find() must not recompute expired entries";
+
+  // Solver must NOT have been called again
+  EXPECT_EQ(solver_calls.load(), 1)
+    << "find() must never invoke the miss solver";
 }

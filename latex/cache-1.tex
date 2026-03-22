@@ -53,16 +53,32 @@
 \maketitle
 
 \begin{abstract}
-This article presents an advanced implementation of a thread-safe cache system in C++ that incorporates TTL (Time To Live) management, entry states, and LRU replacement policies. We detail the concurrency challenges, implemented solutions, and formal verification using Promela models. The implementation has been validated in production, handling \textbf{100,000 requests per second} in a Kubernetes environment with hash routing, solving critical problems such as race conditions, deadlocks, and the ABA problem in highly concurrent environments.
+This article presents an advanced implementation of a thread-safe cache
+system in C++ that incorporates TTL (Time To Live) management with
+sliding window refreshes, entry states, and a variadic API with perfect
+forwarding. We detail the concurrency challenges, lock-free performance
+metrics, and formal verification using advanced Promela models that 
+account for locking gaps and ABA protection. The implementation has been 
+validated in production, handling \textbf{100,000 requests per second} 
+in a Kubernetes environment, solving critical problems such as thundering 
+herds, race conditions, and memory safety in highly concurrent environments.
 \end{abstract}
 
 \section{Introduction}
 
-Cache systems are fundamental components in modern software architectures, especially in distributed and high-performance applications. However, implementing a thread-safe cache presents a critical challenge that goes beyond simple data storage: \textbf{how to handle multiple threads requesting the same key while the value is being computed}.
+Cache systems are fundamental components in modern software
+architectures, especially in distributed and high-performance
+applications. However, implementing a thread-safe cache presents a
+critical challenge that goes beyond simple data storage: \textbf{how to
+handle multiple threads requesting the same key while the value is being
+computed}.
 
 \subsection{The Core Problem: Thundering Herd in Caches}
 
-Consider a scenario where an expensive operation (database query, API call, complex calculation) takes several seconds to complete. Without proper coordination, multiple threads requesting the same key simultaneously will each trigger the expensive operation:
+Consider a scenario where an expensive operation (database query, API
+call, complex calculation) takes several seconds to complete. Without
+proper coordination, multiple threads requesting the same key
+simultaneously will each trigger the expensive operation:
 
 \begin{lstlisting}[caption=Problematic behavior without coordination]
 Time: T0
@@ -78,10 +94,14 @@ Result: N expensive operations for the same key!
 In production systems, this problem manifests as:
 
 \begin{itemize}
-\item \textbf{Backend Overload}: Multiple identical expensive queries hitting the database
-\item \textbf{Resource Waste}: CPU and memory consumed by redundant computations
-\item \textbf{Latency Amplification}: All threads wait for their individual computations
-\item \textbf{Cascade Failures}: Backend systems overwhelmed by duplicate requests
+\item \textbf{Backend Overload}: Multiple identical expensive queries
+      hitting the database
+\item \textbf{Resource Waste}: CPU and memory consumed by redundant
+      computations
+\item \textbf{Latency Amplification}: All threads wait for their
+      individual computations
+\item \textbf{Cascade Failures}: Backend systems overwhelmed by
+      duplicate requests
 \end{itemize}
 
 \subsection{The Challenge: Thread Coordination}
@@ -89,10 +109,14 @@ In production systems, this problem manifests as:
 The solution requires careful coordination where:
 
 \begin{enumerate}
-\item \textbf{One thread computes}: Only the first thread should execute the expensive operation
-\item \textbf{Others wait}: Subsequent threads must wait for the first thread's result
-\item \textbf{All get the result}: Once computed, all waiting threads receive the same value
-\item \textbf{Handle failures}: If computation fails, threads shouldn't wait indefinitely
+\item \textbf{One thread computes}: Only the first thread should execute
+      the expensive operation
+\item \textbf{Others wait}: Subsequent threads must wait for the first
+      thread's result
+\item \textbf{All get the result}: Once computed, all waiting threads
+      receive the same value
+\item \textbf{Handle failures}: If computation fails, threads shouldn't
+      wait indefinitely
 \end{enumerate}
 
 \section{System Architecture}
@@ -103,8 +127,9 @@ Our implementation is based on three fundamental components:
 
 \begin{enumerate}
 \item \textbf{Hash Table}: Stores key-to-cache-entry mappings
-\item \textbf{LRU List}: Doubly-linked list for replacement policy  
-\item \textbf{Cache Entries}: Structures that maintain data, metadata, and synchronization
+\item \textbf{LRU List}: Doubly-linked list for replacement policy
+\item \textbf{Cache Entries}: Structures that maintain data, metadata,
+      and synchronization
 \end{enumerate}
 
 \begin{figure}[htbp]
@@ -129,47 +154,80 @@ Our implementation is based on three fundamental components:
 
 \subsection{Entry States}
 
-Each cache entry maintains one of four possible states that coordinate thread access:
+Each cache entry maintains one of five possible states that coordinate
+thread access and lifecycle management:
 
 \begin{itemize}
-\item \textbf{AVAILABLE}: Entry available for allocation
-\item \textbf{CALCULATING}: Data being computed by miss handler (other threads must wait)
-\item \textbf{READY}: Valid data available (all threads can proceed)
-\item \textbf{FAILED}: Computation failed (cached negative result)
+\item \textbf{EMPTY}: Slot available for a new key; no data associated.
+\item \textbf{COMPUTING}: Data being computed by the miss solver (thundering herd protection).
+\item \textbf{READY}: Valid positive data available (within TTL).
+\item \textbf{FAILED}: Computation failed; negative result cached (within negative TTL).
+\item \textbf{INVALIDATED}: Logically removed; prioritized for LRU eviction but memory-safe for active waiters.
 \end{itemize}
 
 \begin{figure}[htbp]
 \centering
+\resizebox{\textwidth}{!}{
 \begin{tikzpicture}[
-    state/.style={circle, draw, minimum size=1.8cm, font=\small, align=center},
-    arrow/.style={->, thick},
-    node distance=3.5cm
+    state/.style={circle, draw, minimum size=1.8cm, font=\scriptsize, align=center},
+    arrow/.style={->, thick, >=stealth},
+    node distance=2.5cm and 3.2cm
 ]
 
-\node[state, fill=green!20] (available) {AVAILABLE};
-\node[state, fill=yellow!30, right=of available] (calculating) {CALCULATING};
-\node[state, fill=blue!20, below=of calculating] (ready) {READY};
-\node[state, fill=red!20, below=of available] (failed) {FAILED};
+% Nodes
+\node[state, fill=green!10] (empty) {EMPTY};
+\node[state, fill=yellow!20, right=of empty] (computing) {COMPUTING};
+\node[state, fill=red!10, below=of computing] (failed) {FAILED};
+\node[state, fill=blue!10, right=of failed] (ready) {READY};
+\node[state, fill=gray!20, below=of empty] (invalidated) {INVALIDATED};
 
-\draw[arrow] (available) to node[above] {miss handler} (calculating);
-\draw[arrow] (calculating) to node[right] {success} (ready);
-\draw[arrow] (calculating) to node[below left] {failure} (failed);
-\draw[arrow, bend right=45] (ready) to node[left] {evict} (available);
-\draw[arrow, bend left=45] (failed) to node[right] {evict} (available);
+% Arrows
+\draw[arrow] (empty) -- node[above] {miss} (computing);
+\draw[arrow] (computing) -- node[right] {failure} (failed);
+\draw[arrow] (computing) to[bend left=20] node[above right] {success} (ready);
 
-\node[below=1.5cm of ready, align=left] {Key insight: Multiple threads \\ requesting same key wait \\ here and get same result};
+\draw[arrow] (ready) -- node[below] {expire / invalidate} (failed); % Transitional step in some models
+\draw[arrow] (ready) to[bend left=40] node[below] {invalidate} (invalidated);
+\draw[arrow] (failed) -- node[below] {expire} (invalidated);
+\draw[arrow] (invalidated) -- node[left] {evict} (empty);
+
+% Self-loops for TTL refresh
+\draw[arrow] (ready) to[loop right] node[right] {hit (refresh)} (ready);
+\draw[arrow] (failed) to[loop below] node[below] {hit (refresh)} (failed);
 
 \end{tikzpicture}
-\caption{Cache entry state machine preventing thundering herd}
+}
+\caption{Complete state machine including TTL refreshes and lazy invalidation}
 \end{figure}
 
-\textbf{Key insight}: When an entry is in CALCULATING state, subsequent threads accessing the same key will wait on a condition variable rather than starting their own computation.
+\textbf{Key insight}: When an entry is in \texttt{Computing} state, subsequent
+threads accessing the same key will wait on a condition variable rather
+than starting their own computation.
 
 \section{Critical Concurrency Challenges}
 
-\subsection{The Core Primitive}
+\subsection{Variadic API and Perfect Forwarding}
 
-The heart of the system is the \texttt{retrieve\_from\_cache\_or\_compute} function, which solves the fundamental problem of coordinating multiple threads requesting the same key.
+The core primitive \texttt{get\_or\_compute} has been evolved into a
+variadic template that supports arbitrary context propagation:
+
+\begin{lstlisting}[caption=Variadic API with Perfect Forwarding]
+template <typename Key, typename Value, typename... Args>
+CacheResult<Value> get_or_compute(const Key &key, Args... args) {
+    return resolve_miss(entry, now, !existed, std::forward<Args>(args)...);
+}
+\end{lstlisting}
+
+This allows users to pass opaque parameters (e.g., database connections, 
+transaction IDs) directly to the miss solver in a 100\% type-safe manner 
+without runtime overhead.
+
+\subsection{Lock-Free Performance Metrics}
+
+To minimize global lock contention, cache statistics were moved from a 
+protected struct to individual atomic counters (\lstinline|std::atomic<size_t>|). 
+This enables the "fast path" (cache hits) to operate without acquiring the 
+global mutex, significantly increasing throughput under massive concurrency.
 
 \subsection{The Double-Checked Locking Problem}
 
@@ -186,17 +244,21 @@ if (hash_table.find(key) != end) {
 }
 \end{lstlisting}
 
-The problem arises when the main lock is released before finishing with the entry.
+The problem arises when the main lock is released before finishing with
+the entry.
 
 \section{Implemented Solutions}
 
 \subsection{Fine-Grained Synchronization: The Core Mechanism}
 
-The solution to the thundering herd problem relies on \textbf{per-entry synchronization} using a mutex and condition variable for each cache entry, combined with entry states.
+The solution to the thundering herd problem relies on \textbf{per-entry
+synchronization} using a mutex and condition variable for each cache
+entry, combined with entry states.
 
 \subsubsection{Why Per-Entry Locks?}
 
-A single global mutex would serialize all cache access, destroying concurrency:
+A single global mutex would serialize all cache access, destroying
+concurrency:
 
 \begin{lstlisting}[caption=Naive approach with single mutex]
 mutex global_mutex;
@@ -280,93 +342,191 @@ When multiple threads request the same key simultaneously:
 \end{algorithmic}
 \end{algorithm}
 
-\subsection{ABA Problem Prevention}
+\subsection{ABA Problem Prevention and Memory Safety}
 
-The ABA problem is prevented by maintaining \texttt{shared\_ptr} to entries:
-
-\begin{lstlisting}[caption=Using shared\_ptr to prevent ABA]
-shared_ptr<CacheEntry> entry_ptr = hash_table[key];
-// Even if removed from hash_table, entry_ptr keeps memory valid
-unique_lock<mutex> entry_lock(entry_ptr->mutex);
-// Safe to work with entry_ptr
-\end{lstlisting}
-
-\section{Formal Verification}
-
-\subsection{Introduction to Promela and SPIN}
-
-To formally verify the correctness of our cache implementation, we use SPIN (Simple Promela Interpreter), a model checker specifically designed for verifying concurrent systems.
-
-\textbf{Linear Temporal Logic (LTL)}: Properties are expressed using LTL:
-\begin{itemize}
-\item \texttt{[]} (Always): Property must hold in all states
-\item \texttt{<>} (Eventually): Property will eventually become true
-\item \texttt{->} (Implies): Logical implication
-\end{itemize}
-
-\subsection{Modeling Strategy}
-
-Our Promela models abstract the C++ implementation focusing on:
+The ABA problem and use-after-free risks are prevented by a tiered
+ownership model:
 
 \begin{enumerate}
-\item Lock hierarchies and acquisition patterns
-\item State transitions between AVAILABLE, CALCULATING, READY, FAILED
-\item Memory safety - ensuring no use-after-free
-\item Thread coordination via condition variables
+\item \textbf{Internal Refcounts}: Each \texttt{CacheEntry} maintains an
+      atomic reference counter.
+\item \textbf{EntryGuard (RAII)}: A specialized guard acquires a 
+      reference upon entry lookup and releases it upon scope exit.
+\item \textbf{Shared Pointers}: The actual \texttt{Value} is managed 
+      via \texttt{std::shared\_ptr}.
 \end{enumerate}
+
+This ensures that even if an entry is evicted from the hash table or 
+invalidated while a thread is computing its value, the entry's memory 
+remains stable until the last thread finishes its operation.
+
+\section{Public API}
+
+The cache exposes a rich API beyond the core \texttt{get\_or\_compute} method.
+All methods are thread-safe and respect the single-flight semantics.
+
+\subsection{Result Types}
+
+All lookup operations return a \texttt{CacheResult<Value>} that distinguishes
+the origin of the result:
+
+\begin{itemize}
+\item \textbf{HitPositive}: Value found in cache (valid positive entry)
+\item \textbf{HitNegative}: Cached failure found (valid negative entry)
+\item \textbf{ComputedPositive}: Miss solver returned a value (newly computed)
+\item \textbf{ComputedNegative}: Miss solver returned nullptr (newly failed)
+\item \textbf{Saturated}: Cache full with all entries in Computing state
+\end{itemize}
+
+This allows callers to implement telemetry based on cache behavior.
+
+\subsection{Lookup Methods}
 
 \begin{table}[htbp]
 \centering
-\small
-\begin{tabular}{@{}ll@{}}
+\begin{tabular}{@{}llll@{}}
 \toprule
-C++ Implementation & Promela Model \\
+Method & Blocks on Computing & Triggers Solver & TTL Refresh \\
 \midrule
-\texttt{mutex cache\_mtx} & \texttt{byte cache\_mutex} \\
-\texttt{mutex entry->mtx} & \texttt{byte entry\_mutex[]} \\
-\texttt{condition\_variable} & Blocking on entry status \\
-\texttt{shared\_ptr<Entry>} & Reference counting \\
+\texttt{get\_or\_compute(key)} & Yes (CV wait) & Yes & Yes \\
+\texttt{find(key)} & Yes (CV wait) & No & Yes \\
+\texttt{peek(key)} & No (try\_lock) & No & No \\
+\texttt{has(key)} & No & No & No \\
 \bottomrule
 \end{tabular}
-\caption{C++ to Promela correspondence}
+\caption{Comparison of lookup methods}
+\end{table}
+
+\begin{lstlisting}[caption=Lookup API signatures]
+// Primary: compute on miss, wait if Computing
+CacheResult<Value> get_or_compute(const Key &key, Args... args);
+
+// Read-only: wait if Computing, never triggers solver
+std::optional<CacheResult<Value>> find(const Key &key);
+
+// Non-blocking: returns nullopt if entry busy or missing
+std::optional<CacheResult<Value>> peek(const Key &key);
+
+// Fast existence check
+bool has(const Key &key);
+\end{lstlisting}
+
+\subsection{Mutation Methods}
+
+\begin{lstlisting}[caption=Mutation API signatures]
+// Marks entry as Invalidated, moves to LRU tail for priority eviction.
+// Returns false if key not found or entry is Computing.
+bool invalidate(const Key &key);
+
+// Refreshes TTL and moves to MRU. Returns false if expired or missing.
+bool touch(const Key &key);
+\end{lstlisting}
+
+\textbf{Key design decisions}:
+\begin{itemize}
+\item \texttt{invalidate()} refuses to invalidate \texttt{Computing} entries to
+      avoid interrupting ongoing computations.
+\item \texttt{touch()} implements sliding-window TTL: each access extends the
+      entry's lifetime by the full TTL duration.
+\item All methods use \texttt{EntryGuard} RAII to safely handle concurrent
+      eviction during the operation.
+\end{itemize}
+
+\section{Formal Verification}
+
+\subsection{Model Architecture (v5)}
+
+The cache is formally verified using SPIN with a Promela model that faithfully
+captures the C++ synchronization semantics. The model includes:
+
+\begin{itemize}
+\item \textbf{Explicit Refcount}: \texttt{slot\_rc[]} models \texttt{CacheEntry::\_refcount}
+      and \texttt{EntryGuard} RAII lifetime.
+\item \textbf{TTL Aging}: \texttt{slot\_age[]} with threshold models TTL refresh on hit.
+\item \textbf{Three-Phase Locking}: Phase 1 (global lock), Phase 2 (solver), 
+      Phase 3 (entry lock + CV wait).
+\item \textbf{All Public API}: Separate processes model \texttt{get\_or\_compute},
+      \texttt{find}, \texttt{invalidate}, \texttt{touch}, and \texttt{peek}.
+\end{itemize}
+
+\subsection{Concurrent Processes}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{@{}llll@{}}
+\toprule
+Process & Instances & Type & Models \\
+\midrule
+\texttt{Requester} & 4 & One-shot & \texttt{get\_or\_compute()} \\
+\texttt{FindRequester} & 2 & One-shot & \texttt{find()} \\
+\texttt{Background} & 1 & Continuous & TTL aging + expiry \\
+\texttt{Invalidator} & 1 & Continuous & \texttt{invalidate()} \\
+\texttt{TouchRequester} & 1 & Continuous & \texttt{touch()} \\
+\texttt{PeekRequester} & 1 & Continuous & \texttt{peek()} (try\_lock) \\
+\bottomrule
+\end{tabular}
+\caption{10 concurrent processes in the verification model}
 \end{table}
 
 \subsection{Verified Properties}
 
-\begin{lstlisting}[language=Promela, caption=LTL properties verified]
-// Safety: No Deadlock
-ltl no_deadlock { 
-    []<>(!cache_mutex && !entry_mutex[0]) 
-}
+\begin{lstlisting}[language=Promela, caption=LTL properties verified under weak fairness]
+// Liveness: All 6 request threads eventually complete
+ltl all_terminate { <> (request_done[0] && ... && request_done[5]) }
 
-// Safety: No Use-After-Free
-ltl no_use_after_free { 
-    []((entry_lock[0] -> entry_exists[0]))
-}
+// No starvation: Each thread eventually completes
+ltl no_starvation_thread0 { [] (!request_done[0] -> <> request_done[0]) }
+// ... (repeated for threads 1-5)
 
-// Liveness: Operations Complete
-ltl operations_complete { 
-    <>[] (cache_hits + cache_misses > 0) 
-}
+// Materialization: Every requested key is eventually computed
+ltl every_key_materializes { <> (ever_stored[0] && ever_stored[1] && ever_stored[2]) }
 \end{lstlisting}
 
-\subsection{Verification Results}
+\subsection{Verification Results (SPIN 6.5.2)}
 
-The Promela models confirmed:
+\begin{table}[htbp]
+\centering
+\begin{tabular}{@{}lrl@{}}
+\toprule
+Property & States & Result \\
+\midrule
+Safety (23+ assertions) & 3,500,000 & 0 errors \\
+\texttt{all\_terminate} & depth 547 & 0 errors \\
+\texttt{every\_key\_materializes} & depth 512 & 0 errors \\
+\texttt{no\_starvation\_thread0..5} & depth 417--547 & 0 errors \\
+\bottomrule
+\end{tabular}
+\caption{Exhaustive verification results}
+\end{table}
 
-\begin{itemize}
-\item Absence of deadlocks in all operations
-\item No use-after-free - critical for system stability
-\item Correct lifecycle management of cache entries
-\item State consistency during concurrent transitions
-\item Liveness - all operations eventually complete
-\end{itemize}
+\subsection{Bug Found by Formal Verification}
+
+The model revealed a critical bug in \texttt{find\_evictable\_lru()}:
+the C++ code did not check the refcount before eviction, allowing entries
+held by active \texttt{EntryGuard} instances to be evicted, causing
+potential use-after-free.
+
+\begin{lstlisting}[caption=Bug fix identified by formal model]
+// BEFORE (bug): eviction possible with active holders
+if (entry->state() != EntryState::Computing)
+  return entry;
+
+// AFTER (fix): aligned with Promela invariant slot_rc[s] <= 1
+if (entry->state() != EntryState::Computing &&
+    entry->_refcount.load(std::memory_order_acquire) <= 1)
+  return entry;
+\end{lstlisting}
+
+This demonstrates the value of formal verification: the model's
+\texttt{slot\_rc[s] <= 1} guard in eviction was already correct,
+exposing the missing check in the C++ implementation.
 
 \section{Distributed Architecture in Kubernetes}
 
 \subsection{Hash Routing with Multiple Gateways}
 
-The implementation uses hash routing in Kubernetes, distributing requests based on fixture ID.
+The implementation uses hash routing in Kubernetes, distributing
+requests based on fixture ID.
 
 \begin{figure}[htbp]
 \centering
@@ -404,8 +564,10 @@ The implementation uses hash routing in Kubernetes, distributing requests based 
 \subsection{Hash Routing Advantages}
 
 \begin{enumerate}
-\item \textbf{Cache Consistency}: Each fixture ID always reaches the same gateway
-\item \textbf{No Distributed Invalidation}: No cross-gateway coordination needed
+\item \textbf{Cache Consistency}: Each fixture ID always reaches the
+      same gateway
+\item \textbf{No Distributed Invalidation}: No cross-gateway
+      coordination needed
 \item \textbf{Horizontal Scalability}: Easy addition/removal of nodes
 \item \textbf{Fault Tolerance}: Automatic failover in Kubernetes
 \end{enumerate}
@@ -473,7 +635,8 @@ if (success) {
 
 \subsection{Current Problem: Lack of Failover Mechanism}
 
-When a gateway fails, requests are redistributed by Kubernetes to other gateways, causing:
+When a gateway fails, requests are redistributed by Kubernetes to other
+gateways, causing:
 
 \begin{enumerate}
 \item \textbf{Massive Cache Miss}: Other gateways don't have the data
@@ -585,7 +748,8 @@ Recovery time & 5-15 min & < 30s & 20x faster \\
 
 \section{Conclusions}
 
-The presented implementation successfully solves the main challenges of a thread-safe cache system:
+The presented implementation successfully solves the main challenges of
+a thread-safe cache system:
 
 \begin{itemize}
 \item \textbf{Correctness}: Formally verified using Promela
@@ -595,7 +759,9 @@ The presented implementation successfully solves the main challenges of a thread
 \item \textbf{Operational}: Fault tolerance and observability
 \end{itemize}
 
-The combination of hash routing with local cache per gateway has proven effective for use cases with high temporal locality, such as sports fixture data.
+The combination of hash routing with local cache per gateway has proven
+effective for use cases with high temporal locality, such as sports
+fixture data.
 
 \section{Future Work}
 
@@ -612,50 +778,66 @@ The combination of hash routing with local cache per gateway has proven effectiv
 \section{References}
 
 \begin{enumerate}
-\item Herlihy, M., \& Shavit, N. (2012). \emph{The Art of Multiprocessor Programming}. Morgan Kaufmann.
-\item Holzmann, G. J. (2003). \emph{The SPIN Model Checker: Primer and Reference Manual}. Addison-Wesley.
-\item Stack Overflow. ``How to manage repeated requests on a cached server while the result arrives''. \url{https://stackoverflow.com/questions/58651343/}
-\item Williams, A. (2019). \emph{C++ Concurrency in Action}. Manning Publications.
+\item Herlihy, M., \& Shavit, N. (2012). \emph{The Art of Multiprocessor
+      Programming}. Morgan Kaufmann.
+\item Holzmann, G. J. (2003). \emph{The SPIN Model Checker: Primer and
+      Reference Manual}. Addison-Wesley.
+\item Stack Overflow. ``How to manage repeated requests on a cached
+      server while the result
+      arrives''. \url{https://stackoverflow.com/questions/58651343/}
+\item Williams, A. (2019). \emph{C++ Concurrency in Action}. Manning
+      Publications.
 \end{enumerate}
 
 \newpage
 
 \appendix
 
-\section{Promela Models for Formal Verification}
+\section{Promela Model for Formal Verification}
 
-\subsection{Main Cache Model}
+\subsection{Model Overview (v5)}
 
-The complete Promela models are provided in supplementary materials. The main model abstracts critical cache operations focusing on lock interactions and state management.
+The Promela model (\texttt{formal/cache\_model.pml}) provides exhaustive
+verification of the cache's concurrency semantics. Key characteristics:
 
-\textbf{Key features}:
 \begin{itemize}
-\item Abstraction of \texttt{retrieve\_from\_cache\_or\_compute}
-\item Per-entry locks and state transitions
-\item Eviction process modeling
-\item LTL properties for deadlock detection and use-after-free prevention
+\item \textbf{Capacity}: 2 slots, 3 keys, 6 request threads + 4 background processes
+\item \textbf{State vector}: 152 bytes
+\item \textbf{State space}: $\sim$3.5 million states explored exhaustively
+\item \textbf{Verification time}: $\sim$4 seconds on modern hardware
 \end{itemize}
 
-\subsection{Model Scope}
+\subsection{What is Modeled}
 
-\textbf{What is modeled}:
 \begin{itemize}
-\item Lock ordering and acquisition patterns
-\item Entry lifecycle (allocation, use, eviction)
-\item Basic state transitions
-\item Core race condition scenarios
+\item \textbf{Refcount semantics}: \texttt{slot\_rc[]} faithfully models 
+      \texttt{CacheEntry::\_refcount} and \texttt{EntryGuard} RAII
+\item \textbf{TTL aging}: \texttt{slot\_age[]} with \texttt{AGE\_THRESHOLD} 
+      models sliding-window TTL refresh
+\item \textbf{All public API}: \texttt{get\_or\_compute}, \texttt{find}, 
+      \texttt{invalidate}, \texttt{touch}, \texttt{peek}
+\item \textbf{LRU eviction}: With refcount guard (\texttt{rc <= 1})
+\item \textbf{Three-phase locking}: Global lock $\to$ solver $\to$ entry lock
+\item \textbf{CV wait semantics}: Non-owners block on Computing entries
 \end{itemize}
 
-\textbf{What is abstracted}:
+\subsection{What is Abstracted}
+
 \begin{itemize}
-\item Exact TTL timing mechanisms  
-\item Detailed LRU list management
-\item Complex miss handler logic
+\item Exact wall-clock timing (replaced by discrete aging steps)
+\item Hash table collision resolution details
+\item Value content (only state transitions matter)
 \item Circuit breaker integration
 \end{itemize}
 
-The models validate \textbf{structural correctness} of the synchronization approach rather than performance. This focused approach proves absence of critical concurrency bugs like deadlocks and use-after-free.
+\subsection{Verification Value}
 
-Production testing at 100K req/sec complements formal verification by validating performance and functional correctness under realistic loads.
+The model proved its worth by discovering a real bug: the C++ 
+\texttt{find\_evictable\_lru()} was missing the refcount check that the
+model already enforced. This demonstrates that formal verification
+catches bugs that escape code review and testing.
+
+Production testing at 100K req/sec complements formal verification by
+validating performance under realistic loads.
 
 \end{document}

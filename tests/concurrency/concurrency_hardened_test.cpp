@@ -941,3 +941,229 @@ TEST(ConcurrentInvalidateExpiryTest, invalidate_races_with_expiry_and_recompute)
       ASSERT_EQ(*r.value(), 10);
     }
 }
+
+// ================================================================
+// Section 16: invalidate() on Computing entry returns false
+// ================================================================
+
+TEST(ConcurrentInvalidateTest, invalidate_computing_returns_false)
+{
+  atomic<bool> solver_started{false};
+  atomic<bool> solver_can_finish{false};
+
+  Cache<int, int> cache(5, 20s, 5s,
+    [&](const int &key) -> shared_ptr<int>
+    {
+      solver_started.store(true, memory_order_release);
+      while (not solver_can_finish.load(memory_order_acquire))
+        this_thread::sleep_for(10ms);
+      return make_shared<int>(key * 10);
+    });
+
+  // Start computing key 1
+  auto compute_future = async(launch::async, [&]()
+  {
+    return cache.get_or_compute(1);
+  });
+
+  while (not solver_started.load(memory_order_acquire))
+    this_thread::sleep_for(5ms);
+
+  // invalidate() on a Computing entry must return false
+  EXPECT_FALSE(cache.invalidate(1))
+    << "invalidate() must refuse to invalidate Computing entries";
+
+  solver_can_finish.store(true, memory_order_release);
+  auto r = compute_future.get();
+  ASSERT_TRUE(r.is_positive());
+
+  // Now invalidation should succeed
+  EXPECT_TRUE(cache.invalidate(1))
+    << "invalidate() must succeed on Ready entries";
+}
+
+// ================================================================
+// Section 17: invalidate() moves entry to LRU tail (evicted first)
+// ================================================================
+
+TEST(ConcurrentInvalidateTest, invalidate_moves_to_lru_tail)
+{
+  // Cache capacity 2: fill with keys 1 and 2
+  Cache<int, int> cache(2, 20s, 5s,
+    [](const int &key) -> shared_ptr<int>
+    {
+      return make_shared<int>(key * 10);
+    });
+
+  cache.get_or_compute(1);
+  cache.get_or_compute(2);
+
+  // Invalidate key 2 — should move to LRU tail
+  ASSERT_TRUE(cache.invalidate(2));
+
+  // Insert key 3 — must evict key 2 (at LRU tail), not key 1
+  auto r = cache.get_or_compute(3);
+  ASSERT_TRUE(r.is_positive());
+  ASSERT_EQ(*r.value(), 30);
+
+  // Key 1 must still be present
+  EXPECT_TRUE(cache.has(1))
+    << "Invalidated entry should be evicted before non-invalidated ones";
+
+  // Key 2 must be gone (evicted)
+  EXPECT_FALSE(cache.has(2))
+    << "Invalidated entry at LRU tail should have been evicted";
+}
+
+// ================================================================
+// Section 18: Eviction while holder active (refcount protection)
+// ================================================================
+
+TEST(ConcurrentEvictionTest, evict_while_holder_active)
+{
+  // Capacity 2: thread A holds an entry via slow solver, thread B forces eviction
+  atomic<bool> solver_started{false};
+  atomic<bool> solver_can_finish{false};
+
+  Cache<int, int> cache(2, 20s, 5s,
+    [&](const int &key) -> shared_ptr<int>
+    {
+      if (key == 1)
+        {
+          solver_started.store(true, memory_order_release);
+          while (not solver_can_finish.load(memory_order_acquire))
+            this_thread::sleep_for(10ms);
+        }
+      return make_shared<int>(key * 10);
+    });
+
+  // Fill slot 0 with key 0 (fast, completes immediately)
+  cache.get_or_compute(0);
+
+  // Thread A: start slow computation for key 1 (fills slot 1)
+  auto future_a = async(launch::async, [&]()
+  {
+    return cache.get_or_compute(1);
+  });
+
+  while (not solver_started.load(memory_order_acquire))
+    this_thread::sleep_for(5ms);
+
+  // Thread B: compute key 2 — cache full, must evict.
+  // Key 0 is evictable (Ready, rc=1). Key 1 is Computing (not evictable).
+  auto future_b = async(launch::async, [&]()
+  {
+    return cache.get_or_compute(2);
+  });
+
+  // Give thread B time to evict and compute
+  this_thread::sleep_for(50ms);
+
+  // Release thread A's solver
+  solver_can_finish.store(true, memory_order_release);
+
+  auto result_a = future_a.get();
+  auto result_b = future_b.get();
+
+  // Both must succeed — no crash, no use-after-free
+  ASSERT_TRUE(result_a.is_positive());
+  ASSERT_EQ(*result_a.value(), 10);
+  ASSERT_TRUE(result_b.is_positive());
+  ASSERT_EQ(*result_b.value(), 20);
+
+  // Key 1 and 2 should be present, key 0 was evicted
+  EXPECT_TRUE(cache.has(1));
+  EXPECT_TRUE(cache.has(2));
+  EXPECT_FALSE(cache.has(0))
+    << "Key 0 (Ready, rc=1) should have been evicted, not Computing key 1";
+}
+
+// ================================================================
+// Section 19: Thundering herd with eviction pressure
+// ================================================================
+
+TEST(ConcurrentEvictionTest, thundering_herd_with_eviction)
+{
+  atomic<int> solver_calls{0};
+
+  Cache<int, int> cache(3, 20s, 5s,
+    [&](const int &key) -> shared_ptr<int>
+    {
+      solver_calls.fetch_add(1);
+      this_thread::sleep_for(100ms);
+      return make_shared<int>(key * 10);
+    });
+
+  // Prefill cache to 2/3 capacity
+  cache.get_or_compute(100);
+  cache.get_or_compute(200);
+  int initial_calls = solver_calls.load();
+
+  // 10 threads all request key 42 simultaneously (thundering herd)
+  // This also forces eviction (cache at capacity)
+  constexpr int N = 10;
+  vector<future<CacheResult<int>>> futures;
+
+  for (int i = 0; i < N; ++i)
+    futures.push_back(async(launch::async, [&]()
+    {
+      return cache.get_or_compute(42);
+    }));
+
+  for (auto &f : futures)
+    {
+      auto r = f.get();
+      ASSERT_TRUE(r.is_positive());
+      ASSERT_EQ(*r.value(), 420);
+    }
+
+  // Single-flight: solver for key 42 should be called exactly once
+  EXPECT_EQ(solver_calls.load(), initial_calls + 1)
+    << "Single-flight must coalesce even under eviction pressure";
+}
+
+// ================================================================
+// Section 20: touch() racing with TTL expiry
+// ================================================================
+
+TEST(ConcurrentTouchTest, touch_during_expiry_race)
+{
+  Cache<int, int> cache(5, 1s, 1s,
+    [](const int &key) -> shared_ptr<int>
+    {
+      return make_shared<int>(key * 10);
+    });
+
+  for (int round = 0; round < 10; ++round)
+    {
+      cache.get_or_compute(1);
+
+      // Wait until close to expiry
+      this_thread::sleep_for(900ms);
+
+      // Race: multiple threads call touch() around expiry boundary
+      constexpr int N = 5;
+      vector<future<bool>> touch_results;
+
+      for (int i = 0; i < N; ++i)
+        touch_results.push_back(async(launch::async, [&, i]()
+        {
+          this_thread::sleep_for(chrono::milliseconds(i * 30));
+          return cache.touch(1);
+        }));
+
+      // Concurrently, another thread does get_or_compute (may recompute)
+      auto compute_future = async(launch::async, [&]()
+      {
+        this_thread::sleep_for(150ms);
+        return cache.get_or_compute(1);
+      });
+
+      for (auto &f : touch_results)
+        f.get();  // Should not crash regardless of true/false
+
+      auto r = compute_future.get();
+      ASSERT_TRUE(r.is_positive());
+      ASSERT_EQ(*r.value(), 10);
+    }
+}

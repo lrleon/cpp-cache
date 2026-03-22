@@ -20,11 +20,14 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <concepts>
 #include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
+#include <type_traits>
 
 #include <aleph.H>
 #include <dlink.H>
@@ -72,6 +75,7 @@ struct CacheStats
  * @tparam Cmp Equality comparator for keys (default: std::equal_to<Key>).
  */
 template <typename Key, typename Value, typename Cmp = std::equal_to<Key>, typename... Args>
+  requires std::equality_comparable<Key>
 class Cache
 {
 public:
@@ -256,13 +260,13 @@ private:
 
   MissSolver _solver; /**< User-provided callback to fetch missing values. */
 
-  std::atomic<size_t> _stat_hits{0};
-  std::atomic<size_t> _stat_misses{0};
-  std::atomic<size_t> _stat_negative_hits{0};
-  std::atomic<size_t> _stat_evictions{0};
-  std::atomic<size_t> _stat_saturations{0};
+  alignas(64) std::atomic<size_t> _stat_hits{0};
+  alignas(64) std::atomic<size_t> _stat_misses{0};
+  alignas(64) std::atomic<size_t> _stat_negative_hits{0};
+  alignas(64) std::atomic<size_t> _stat_evictions{0};
+  alignas(64) std::atomic<size_t> _stat_saturations{0};
 
-  std::atomic<size_t> _computing_count{0}; /**< Fast track for saturation check (audit fix 3.4). */
+  alignas(64) std::atomic<size_t> _computing_count{0}; /**< Fast track for saturation check (audit fix 3.4). */
 
   // ================================================================
   // LRU helpers (must be called with _mtx held)
@@ -311,7 +315,9 @@ private:
   CacheEntry *find_evictable_lru() const
   {
     for (Dlink *p = _lru_list.get_prev(); p != const_cast<Dlink *>(&_lru_list); p = p->get_prev())
-      if (CacheEntry *entry = _dlink_lru_to_CacheEntry(p); entry->state() != EntryState::Computing)
+      if (CacheEntry *entry = _dlink_lru_to_CacheEntry(p);
+          entry->state() != EntryState::Computing and
+          entry->_refcount.load(std::memory_order_acquire) <= 1)
         return entry;
     return nullptr;
   }
@@ -838,7 +844,7 @@ public:
   }
 
   /**
-   * @brief Refreshes the TTL of a valid entry and moves it to MRU.
+   * @brief Refreshes the TTL of a valid entry (Ready or Failed) and moves it to MRU.
    *
    * @param key The key to touch.
    * @return true if the key was found, valid, and refreshed; false otherwise.
@@ -859,13 +865,16 @@ public:
     auto now = std::chrono::steady_clock::now();
     std::scoped_lock entry_lock(entry->mtx());
 
-    if (entry->state() != EntryState::Ready)
+    if (entry->state() != EntryState::Ready and entry->state() != EntryState::Failed)
       return false;
 
     if (entry->has_expired(now))
       return false;
 
-    entry->set_expiration(now + _positive_ttl);
+    if (entry->state() == EntryState::Ready)
+      entry->set_expiration(now + _positive_ttl);
+    else
+      entry->set_expiration(now + _negative_ttl);
 
     {
       std::scoped_lock glock(_mtx);
@@ -873,6 +882,47 @@ public:
     }
 
     return true;
+  }
+
+  /**
+   * @brief Truly non-blocking inspection of the cache.
+   *
+   * Unlike find(), this method never blocks. If the entry is being computed,
+   * it returns std::nullopt immediately.
+   *
+   * @param key The key to peek at.
+   * @return The result if found and Ready/Failed, or std::nullopt if missing,
+   *         expired, or Computing.
+   */
+  std::optional<CacheResult<Value>> peek(const Key &key)
+  {
+    CacheEntry *entry;
+    {
+      std::scoped_lock glock(_mtx);
+      entry = search_entry(key);
+      if (entry == nullptr)
+        return std::nullopt;
+      entry->acquire();
+    }
+
+    EntryGuard guard(entry);
+
+    auto now = std::chrono::steady_clock::now();
+    std::unique_lock entry_lock(entry->mtx(), std::try_to_lock);
+
+    if (not entry_lock.owns_lock())
+      return std::nullopt; // Busy entry, don't wait
+
+    if (not is_valid_hit(entry, now))
+      return std::nullopt;
+
+    if (entry->state() == EntryState::Ready)
+      return CacheResult<Value>::hit_positive(entry->value());
+
+    if (entry->state() == EntryState::Failed)
+      return CacheResult<Value>::hit_negative();
+
+    return std::nullopt;
   }
 
   /**

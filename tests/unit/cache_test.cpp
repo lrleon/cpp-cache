@@ -186,6 +186,21 @@ TEST_F(BasicFixture, find_nonexistent)
   ASSERT_FALSE(r.has_value());
 }
 
+TEST_F(BasicFixture, peek_api)
+{
+  // peek on missing key
+  auto p1 = cache.peek(1);
+  ASSERT_FALSE(p1.has_value());
+
+  cache.get(1);
+
+  // peek on existing key
+  auto p2 = cache.peek(1);
+  ASSERT_TRUE(p2.has_value());
+  ASSERT_TRUE(p2->is_hit());
+  ASSERT_EQ(*p2->value(), 10);
+}
+
 TEST_F(BasicFixture, invalidate_entry)
 {
   cache.get_or_compute(1);
@@ -318,6 +333,23 @@ TEST_F(NegativeCacheFixture, negative_hit_refreshes_ttl)
   ASSERT_TRUE(r3.is_negative());
   ASSERT_TRUE(r3.is_hit());
   ASSERT_EQ(call_count, 1); // Solver not called again
+}
+
+TEST_F(NegativeCacheFixture, negative_touch)
+{
+  cache.get_or_compute(1);
+  ASSERT_EQ(call_count, 1);
+
+  this_thread::sleep_for(600ms);
+
+  // Manual touch on negative result
+  ASSERT_TRUE(cache.touch(1));
+
+  this_thread::sleep_for(600ms);
+
+  // Should still be cached negative due to manual touch
+  ASSERT_EQ(cache.get(1), nullptr);
+  ASSERT_EQ(call_count, 1);
 }
 
 // ================================================================
