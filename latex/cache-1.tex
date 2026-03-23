@@ -186,10 +186,13 @@ thread access and lifecycle management:
 \draw[arrow] (computing) -- node[right] {failure} (failed);
 \draw[arrow] (computing) to[bend left=20] node[above right] {success} (ready);
 
-\draw[arrow] (ready) -- node[below] {expire / invalidate} (failed); % Transitional step in some models
 \draw[arrow] (ready) to[bend left=40] node[below] {invalidate} (invalidated);
 \draw[arrow] (failed) -- node[below] {expire} (invalidated);
 \draw[arrow] (invalidated) -- node[left] {evict} (empty);
+
+% Expiration note for Ready
+\node[align=center, font=\scriptsize, right=1.5cm of ready] (expired) {checked via \\ \texttt{has\_expired()}};
+\draw[->, thick, dashed] (ready) -- (expired);
 
 % Self-loops for TTL refresh
 \draw[arrow] (ready) to[loop right] node[right] {hit (refresh)} (ready);

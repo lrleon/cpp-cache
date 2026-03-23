@@ -6,17 +6,17 @@
 // are marked with [BUG x.y] referencing the audit section.
 //
 
-# include <atomic>
-# include <chrono>
-# include <functional>
-# include <future>
-# include <memory>
-# include <string>
-# include <thread>
-# include <vector>
-# include <gtest/gtest.h>
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <future>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
+#include <gtest/gtest.h>
 
-# include <cache/cache.H>
+#include <cache/cache.H>
 
 using namespace std;
 using namespace std::chrono;
@@ -76,8 +76,8 @@ TEST(EdgeCase, zero_positive_ttl_expires_immediately)
   ASSERT_TRUE(r1.is_positive());
   ASSERT_EQ(*r1.value(), 10);
 
-  // Tiny sleep to ensure steady_clock advances
-  this_thread::sleep_for(1ms);
+  // Small sleep to ensure steady_clock advances on slower CI hosts
+  this_thread::sleep_for(10ms);
 
   // With TTL=0, the entry should be expired
   EXPECT_FALSE(cache.has(1))

@@ -551,6 +551,10 @@ private:
         // We are the winning thread: mark as Computing and release lock before calling solver.
         // Releasing the lock is vital to allow other threads to access other keys.
         entry->set_state(EntryState::Computing);
+
+        // _computing_count is an atomic hint. Here it's updated outside the global _mtx
+        // so a small imprecision is acceptable. This atomic value is only used for the 
+        // saturation fast-path check.
         ++_computing_count;
       }
 
@@ -654,7 +658,19 @@ public:
    * The caller is responsible for ensuring all operations have completed
    * (e.g., via thread join or barrier) before destruction.
    */
-  ~Cache() = default;
+  ~Cache()
+  {
+#ifndef NDEBUG
+    std::scoped_lock glock(_mtx);
+    for (auto it = _table.begin(); it != _table.end(); ++it)
+      {
+        CacheEntry *entry = static_cast<CacheEntry *>(*it);
+        // Table owns 1 ref. Anything > 1 means an active external reference!
+        assert(entry->_refcount.load(std::memory_order_relaxed) == 1 &&
+               "Cache destroyed with active external operations in flight!");
+      }
+#endif
+  }
 
   /// @name Non-copyable/Non-movable
   /// Cache contains mutexes and condition variables which are not copyable or movable.
@@ -780,15 +796,20 @@ public:
         // Refresh TTL on hit (fixes audit design issue 4.1)
         entry->set_expiration(std::chrono::steady_clock::now() + _positive_ttl);
 
+        auto val = entry->value();
+        entry_lock.unlock();
+
         std::scoped_lock glock(_mtx);
         lru_move_to_mru(entry);
-        return CacheResult<Value>::hit_positive(entry->value());
+        return CacheResult<Value>::hit_positive(val);
       }
 
     if (entry->state() == EntryState::Failed)
       {
         // Refresh TTL on hit for negative values too
         entry->set_expiration(std::chrono::steady_clock::now() + _negative_ttl);
+
+        entry_lock.unlock();
 
         std::scoped_lock glock(_mtx);
         lru_move_to_mru(entry);

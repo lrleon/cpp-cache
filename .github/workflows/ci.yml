@@ -31,7 +31,7 @@ jobs:
         run: cmake -S . -B build -G Ninja -DALEPH_DIR="$ALEPH_DIR"
 
       - name: Build unit and concurrency tests
-        run: cmake --build build --target cache_unit_test cache_concurrency_test
+        run: cmake --build build --target cache_unit_test cache_concurrency_test cache_hardened_test cache_concurrency_hardened_test
 
       - name: Run test suite
         run: ctest --test-dir build --output-on-failure

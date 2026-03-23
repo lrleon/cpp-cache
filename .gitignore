@@ -18,8 +18,8 @@ cmake-build-debug/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
-Makefile
-*.cmake
+build/Makefile
+build/*.cmake
 
 # Test outputs
 *.log
@@ -31,4 +31,5 @@ Aleph-w/
 # Temporary files
 *.tmp
 *.bak
-.DS_StorePlan.md
+.DS_Store
+Plan.md

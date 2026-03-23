@@ -9,17 +9,17 @@
 // Run with -DSANITIZE=thread for systematic race/lock-order detection.
 //
 
-# include <atomic>
-# include <chrono>
-# include <future>
-# include <map>
-# include <mutex>
-# include <random>
-# include <thread>
-# include <vector>
-# include <gtest/gtest.h>
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <map>
+#include <mutex>
+#include <random>
+#include <thread>
+#include <vector>
+#include <gtest/gtest.h>
 
-# include <cache/cache.H>
+#include <cache/cache.H>
 
 using namespace std;
 using namespace std::chrono;

@@ -1,4 +1,4 @@
-# Aleph-w C++ Code Style
+# Project C++ Code Style
 # Based on project conventions: 2 spaces, next-line indented braces, prefer and/or/not
 
 BasedOnStyle: LLVM
