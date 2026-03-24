@@ -50,7 +50,8 @@ build_and_test() {
 
     # Configure
     log_info "Configuring $build_type..."
-    if ! cmake -DCMAKE_BUILD_TYPE="$build_type" ..; then
+    # -DBUILD_TESTS=OFF is passed to Aleph-w to avoid including its 289+ tests
+    if ! cmake -DCMAKE_BUILD_TYPE="$build_type" -DBUILD_TESTS=OFF ..; then
         log_error "Configuration failed for $build_type"
         return 1
     fi
