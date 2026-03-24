@@ -105,7 +105,7 @@ private:
     using BucketBase = Aleph::LhashBucketVtl<Key>;
 
     std::shared_ptr<Value> _value;
-    EntryState _state = EntryState::Empty;
+    std::atomic<EntryState> _state{EntryState::Empty};
 
     Dlink _dlink_lru; /**< Embedded link for the LRU doubly-linked list. */
 
@@ -181,12 +181,12 @@ private:
 
     EntryState state() const noexcept
     {
-      return _state;
+      return _state.load(std::memory_order_acquire);
     }
 
     void set_state(EntryState s) noexcept
     {
-      _state = s;
+      _state.store(s, std::memory_order_release);
     }
 
     const std::shared_ptr<Value> &value() const noexcept

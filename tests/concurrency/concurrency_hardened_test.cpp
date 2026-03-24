@@ -665,12 +665,14 @@ TEST(StressTest, random_keys_random_delays_threadsafe)
   constexpr int NUM_KEYS = 20;
 
   vector<future<CacheResult<int>>> futures;
+  vector<int> keys;
 
   for (int i = 0; i < NUM_THREADS; ++i)
     {
       mt19937 rng(i * 42 + 1);
       uniform_int_distribution<int> key_dist(1, NUM_KEYS);
       int key = key_dist(rng);
+      keys.push_back(key);
 
       futures.push_back(async(launch::async, [&cache, key]()
       {
@@ -678,14 +680,13 @@ TEST(StressTest, random_keys_random_delays_threadsafe)
       }));
     }
 
-  for (auto &f : futures)
+  for (size_t i = 0; i < futures.size(); ++i)
     {
-      auto r = f.get();
+      auto r = futures[i].get();
       ASSERT_TRUE(r.is_positive());
       ASSERT_NE(r.value(), nullptr);
-      // Verify value matches key
-      int val = *r.value();
-      EXPECT_EQ(val % 10, 0) << "Value should be key*10";
+      EXPECT_EQ(*r.value(), keys[i] * 10)
+        << "Value should be key*10 for key=" << keys[i];
     }
 }
 
