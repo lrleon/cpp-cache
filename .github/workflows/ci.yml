@@ -28,7 +28,7 @@ jobs:
         run: git clone --depth=1 https://github.com/lrleon/Aleph-w.git "$ALEPH_DIR"
 
       - name: Configure CMake
-        run: cmake -S . -B build -G Ninja -DALEPH_DIR="$ALEPH_DIR"
+        run: cmake -S . -B build -G Ninja -DALEPH_DIR="$ALEPH_DIR" -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF
 
       - name: Build unit and concurrency tests
         run: cmake --build build --target cache_unit_test cache_concurrency_test cache_hardened_test cache_concurrency_hardened_test
