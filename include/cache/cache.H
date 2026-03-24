@@ -532,21 +532,33 @@ private:
               return entry->state() != EntryState::Computing;
             });
 
-            // Re-check after waiting
+            // Re-check after waiting — count these as hits since the value came from cache
             if (entry->state() == EntryState::Ready)
-              return CacheResult<Value>::hit_positive(entry->value());
+              {
+                _stat_hits.fetch_add(1, std::memory_order_relaxed);
+                return CacheResult<Value>::hit_positive(entry->value());
+              }
 
             if (entry->state() == EntryState::Failed)
-              return CacheResult<Value>::hit_negative();
+              {
+                _stat_negative_hits.fetch_add(1, std::memory_order_relaxed);
+                return CacheResult<Value>::hit_negative();
+              }
           }
 
         // If entry is already Ready/Failed (e.g., race where two threads saw miss,
         // one finished while the other was still entering resolve_miss).
         if (entry->state() == EntryState::Ready)
-          return CacheResult<Value>::hit_positive(entry->value());
+          {
+            _stat_hits.fetch_add(1, std::memory_order_relaxed);
+            return CacheResult<Value>::hit_positive(entry->value());
+          }
 
         if (entry->state() == EntryState::Failed)
-          return CacheResult<Value>::hit_negative();
+          {
+            _stat_negative_hits.fetch_add(1, std::memory_order_relaxed);
+            return CacheResult<Value>::hit_negative();
+          }
 
         // We are the winning thread: mark as Computing and release lock before calling solver.
         // Releasing the lock is vital to allow other threads to access other keys.
@@ -610,9 +622,13 @@ private:
     entry_lock.unlock();
 
     // Structural update: move the refreshed/new entry to MRU position.
+    // Guard against a concurrent invalidate() that may have occurred after we
+    // released entry_lock — only promote terminal (Ready/Failed) entries.
     {
       std::scoped_lock glock(_mtx);
-      lru_move_to_mru(entry);
+      auto s = entry->state();
+      if (s == EntryState::Ready or s == EntryState::Failed)
+        lru_move_to_mru(entry);
     }
     _stat_misses.fetch_add(1, std::memory_order_relaxed);
 
@@ -662,11 +678,11 @@ public:
   {
 #ifndef NDEBUG
     std::scoped_lock glock(_mtx);
-    for (auto it = _table.begin(); it != _table.end(); ++it)
+    for (typename HashTable::Iterator it(_table); it.has_curr(); it.next_ne())
       {
-        CacheEntry *entry = static_cast<CacheEntry *>(*it);
+        auto *entry = static_cast<CacheEntry *>(it.get_curr_ne());
         // Table owns 1 ref. Anything > 1 means an active external reference!
-        assert(entry->_refcount.load(std::memory_order_relaxed) == 1 &&
+        assert(entry->_refcount.load(std::memory_order_relaxed) == 1 and
                "Cache destroyed with active external operations in flight!");
       }
 #endif
@@ -799,8 +815,13 @@ public:
         auto val = entry->value();
         entry_lock.unlock();
 
-        std::scoped_lock glock(_mtx);
-        lru_move_to_mru(entry);
+        {
+          std::scoped_lock glock(_mtx);
+          // Guard against concurrent invalidate() after entry_lock was released
+          auto s = entry->state();
+          if (s == EntryState::Ready or s == EntryState::Failed)
+            lru_move_to_mru(entry);
+        }
         return CacheResult<Value>::hit_positive(val);
       }
 
@@ -811,8 +832,13 @@ public:
 
         entry_lock.unlock();
 
-        std::scoped_lock glock(_mtx);
-        lru_move_to_mru(entry);
+        {
+          std::scoped_lock glock(_mtx);
+          // Guard against concurrent invalidate() after entry_lock was released
+          auto s = entry->state();
+          if (s == EntryState::Ready or s == EntryState::Failed)
+            lru_move_to_mru(entry);
+        }
         return CacheResult<Value>::hit_negative();
       }
 
@@ -967,7 +993,12 @@ public:
     auto now = std::chrono::steady_clock::now();
     std::scoped_lock entry_lock(entry->mtx());
 
-    return is_valid_hit(entry, now);
+    // has() reports only terminal/ready states — Computing is intentionally excluded
+    // so it stays consistent with peek() and does not treat in-flight entries as hits.
+    auto s = entry->state();
+    if (s != EntryState::Ready and s != EntryState::Failed)
+      return false;
+    return not entry->has_expired(now);
   }
 
   // =============================================================
