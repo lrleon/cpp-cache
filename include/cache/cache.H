@@ -25,9 +25,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <new>
 #include <optional>
-#include <type_traits>
 
 #include <aleph.H>
 #include <dlink.H>
@@ -153,62 +151,109 @@ private:
       _refcount.fetch_add(1, std::memory_order_relaxed);
     }
 
-    /** @brief Decrement refcount. Returns true if it reached zero (caller must delete). */
+    /**
+     * @brief Decrement refcount.
+     * @return True if refcount reached zero (caller must delete), false otherwise.
+     */
     bool release() noexcept
     {
       return _refcount.fetch_sub(1, std::memory_order_acq_rel) == 1;
     }
 
+    /**
+     * @brief Get the key associated with this entry.
+     * @return A constant reference to the key.
+     */
     const Key &key() const noexcept
     {
       return this->get_key();
     }
 
+    /**
+     * @brief Get the LRU link for this entry.
+     * @return A pointer to the Dlink object.
+     */
     Dlink *link_lru() noexcept
     {
       return &_dlink_lru;
     }
 
+    /**
+     * @brief Get the per-entry mutex.
+     * @return A reference to the mutex.
+     */
     std::mutex &mtx() noexcept
     {
       return _mtx;
     }
 
+    /**
+     * @brief Get the per-entry condition variable.
+     * @return A reference to the condition variable.
+     */
     std::condition_variable &cv() noexcept
     {
       return _cv;
     }
 
+    /**
+     * @brief Get the current state of the entry.
+     * @return The EntryState value.
+     */
     EntryState state() const noexcept
     {
       return _state.load(std::memory_order_acquire);
     }
 
+    /**
+     * @brief Set the state of the entry.
+     * @param s The new EntryState.
+     */
     void set_state(EntryState s) noexcept
     {
       _state.store(s, std::memory_order_release);
     }
 
+    /**
+     * @brief Get the cached value.
+     * @return A constant reference to the shared_ptr containing the value.
+     */
     const std::shared_ptr<Value> &value() const noexcept
     {
       return _value;
     }
 
+    /**
+     * @brief Set the cached value.
+     * @param v The shared_ptr to the value.
+     */
     void set_value(std::shared_ptr<Value> v) noexcept
     {
       _value = std::move(v);
     }
 
+    /**
+     * @brief Clears the cached value (resets shared_ptr).
+     */
     void clear_value() noexcept
     {
       _value.reset();
     }
 
+    /**
+     * @brief Check if the entry has expired.
+     * @param now The current time point.
+     * @return True if expired, false otherwise.
+     */
     bool has_expired(const std::chrono::steady_clock::time_point &now) const noexcept
     {
       return now > _expiration;
     }
 
+    /**
+     * @brief Set the expiration time for this entry.
+     * @param exp The expiration time point.
+     */
     void set_expiration(const std::chrono::steady_clock::time_point &exp) noexcept
     {
       _expiration = exp;
@@ -266,7 +311,8 @@ private:
   alignas(64) std::atomic<size_t> _stat_evictions{0};
   alignas(64) std::atomic<size_t> _stat_saturations{0};
 
-  alignas(64) std::atomic<size_t> _computing_count{0}; /**< Fast track for saturation check (audit fix 3.4). */
+  alignas(64) std::atomic<size_t> _computing_count{
+    0}; /**< Fast track for saturation check (audit fix 3.4). */
 
   // ================================================================
   // LRU helpers (must be called with _mtx held)
@@ -316,8 +362,8 @@ private:
   {
     for (Dlink *p = _lru_list.get_prev(); p != const_cast<Dlink *>(&_lru_list); p = p->get_prev())
       if (CacheEntry *entry = _dlink_lru_to_CacheEntry(p);
-          entry->state() != EntryState::Computing and
-          entry->_refcount.load(std::memory_order_acquire) <= 1)
+          entry->state() != EntryState::Computing
+          and entry->_refcount.load(std::memory_order_acquire) <= 1)
         return entry;
     return nullptr;
   }
@@ -343,7 +389,11 @@ private:
   // Hash table helpers
   // ================================================================
 
-  /** @brief Cast a table bucket to CacheEntry. */
+  /**
+   * @brief Cast a table bucket to CacheEntry.
+   * @param bucket Pointer to the hash table bucket.
+   * @return Pointer to the corresponding CacheEntry.
+   */
   static CacheEntry *to_entry(Bucket *bucket) noexcept
   {
     return static_cast<CacheEntry *>(bucket);
@@ -354,20 +404,31 @@ private:
    *
    * This eliminates the audit bug 3.1 pattern where a temporary CacheEntry
    * (with its mutex and condition_variable) was constructed just for lookup.
+   *
+   * @param key The key to search for.
+   * @return Pointer to the found entry, or nullptr if not found.
    */
   CacheEntry *search_entry(const Key &key) const
   {
     return to_entry(_table.search(key));
   }
 
-  // Default hash function for Key using Aleph's dft_hash_fct
+  /**
+   * @brief Default hash function for Key using Aleph's dft_hash_fct.
+   * @param key The key to hash.
+   * @return The computed hash value.
+   */
   static size_t default_key_hash(const Key &key) noexcept
   {
     return Aleph::dft_hash_fct(key);
   }
 
-  // Placeholder hash for constructor — immediately replaced by set_hash_fct.
-  // Avoids instantiating dft_hash_ptr_fct<Key> for types without Aleph hashing.
+  /**
+   * @brief Placeholder hash for constructor — immediately replaced by set_hash_fct.
+   * Avoids instantiating dft_hash_ptr_fct<Key> for types without Aleph hashing.
+   * @param key The key to hash (unused).
+   * @return Always returns 0.
+   */
   static size_t placeholder_hash(const Key &) noexcept
   {
     return 0;
@@ -439,6 +500,9 @@ private:
 
   /**
    * @brief Checks if a cache entry is currently usable.
+   * @param entry Pointer to the cache entry to check.
+   * @param now Current time point for expiration check.
+   * @return True if the entry is valid and usable, false otherwise.
    */
   static bool is_valid_hit(CacheEntry *entry, const std::chrono::steady_clock::time_point &now)
   {
@@ -463,6 +527,10 @@ private:
    *
    * If the entry is valid but Computing, this method blocks until the solver finishes.
    * If the entry is expired, it clears it to allow re-computation.
+   *
+   * @param entry Pointer to the cache entry.
+   * @param now Current time point.
+   * @return CacheResult if hit found, or std::nullopt if it needs re-computation.
    */
   std::optional<CacheResult<Value>> resolve_hit(CacheEntry *entry,
                                                 const std::chrono::steady_clock::time_point &now)
@@ -565,7 +633,7 @@ private:
         entry->set_state(EntryState::Computing);
 
         // _computing_count is an atomic hint. Here it's updated outside the global _mtx
-        // so a small imprecision is acceptable. This atomic value is only used for the 
+        // so a small imprecision is acceptable. This atomic value is only used for the
         // saturation fast-path check.
         ++_computing_count;
       }
@@ -682,8 +750,8 @@ public:
       {
         auto *entry = static_cast<CacheEntry *>(it.get_curr_ne());
         // Table owns 1 ref. Anything > 1 means an active external reference!
-        assert(entry->_refcount.load(std::memory_order_relaxed) == 1 and
-               "Cache destroyed with active external operations in flight!");
+        assert(entry->_refcount.load(std::memory_order_relaxed) == 1
+               and "Cache destroyed with active external operations in flight!");
       }
 #endif
   }
@@ -958,7 +1026,7 @@ public:
     std::unique_lock entry_lock(entry->mtx(), std::try_to_lock);
 
     if (not entry_lock.owns_lock())
-      return std::nullopt; // Busy entry, don't wait
+      return std::nullopt;  // Busy entry, don't wait
 
     if (not is_valid_hit(entry, now))
       return std::nullopt;
@@ -1005,29 +1073,36 @@ public:
   // Queries
   // =============================================================
 
-  /** @brief Returns the current number of entries in the cache. */
+  /**
+   * @brief Returns the current number of entries in the cache.
+   * @return Current number of entries.
+   */
   size_t size() const
   {
     std::scoped_lock glock(const_cast<std::mutex &>(_mtx));
     return _table.size();
   }
 
-  /** @brief Returns the maximum capacity of the cache. */
+  /**
+   * @brief Returns the maximum capacity of the cache.
+   * @return Cache capacity.
+   */
   size_t capacity() const noexcept
   {
     return _capacity;
   }
 
-  /** @brief Returns a snapshot of the cache statistics. */
+  /**
+   * @brief Returns a snapshot of the cache statistics.
+   * @return CacheStats object.
+   */
   CacheStats stats() const
   {
-    return CacheStats{
-      _stat_hits.load(std::memory_order_relaxed),
-      _stat_misses.load(std::memory_order_relaxed),
-      _stat_negative_hits.load(std::memory_order_relaxed),
-      _stat_evictions.load(std::memory_order_relaxed),
-      _stat_saturations.load(std::memory_order_relaxed)
-    };
+    return CacheStats{_stat_hits.load(std::memory_order_relaxed),
+                      _stat_misses.load(std::memory_order_relaxed),
+                      _stat_negative_hits.load(std::memory_order_relaxed),
+                      _stat_evictions.load(std::memory_order_relaxed),
+                      _stat_saturations.load(std::memory_order_relaxed)};
   }
 
 };  // end class Cache

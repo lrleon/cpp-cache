@@ -61,67 +61,102 @@ public:
     // empty
   }
 
-  /** @brief Factory: positive cache hit. */
+  /**
+   * @brief Factory: positive cache hit.
+   * @param v The cached value.
+   * @return A CacheResult representing a positive hit.
+   */
   static CacheResult hit_positive(std::shared_ptr<Value> v)
   {
     return CacheResult(ResultOrigin::HitPositive, std::move(v));
   }
 
-  /** @brief Factory: negative cache hit (cached failure). */
+  /**
+   * @brief Factory: negative cache hit (cached failure).
+   * @return A CacheResult representing a negative hit.
+   */
   static CacheResult hit_negative()
   {
     return CacheResult(ResultOrigin::HitNegative, nullptr);
   }
 
-  /** @brief Factory: freshly computed positive result. */
+  /**
+   * @brief Factory: freshly computed positive result.
+   * @param v The computed value.
+   * @return A CacheResult representing a freshly computed positive result.
+   */
   static CacheResult computed_positive(std::shared_ptr<Value> v)
   {
     return CacheResult(ResultOrigin::ComputedPositive, std::move(v));
   }
 
-  /** @brief Factory: freshly computed negative result (solver failed). */
+  /**
+   * @brief Factory: freshly computed negative result (solver failed).
+   * @return A CacheResult representing a freshly computed negative result.
+   */
   static CacheResult computed_negative()
   {
     return CacheResult(ResultOrigin::ComputedNegative, nullptr);
   }
 
-  /** @brief Factory: cache saturated (all entries Computing). */
+  /**
+   * @brief Factory: cache saturated (all entries Computing).
+   * @return A CacheResult representing a saturated cache state.
+   */
   static CacheResult saturated()
   {
     return CacheResult(ResultOrigin::Saturated, nullptr);
   }
 
-  /** @brief Returns true if the result contains a positive value. */
+  /**
+   * @brief Returns true if the result contains a positive value.
+   * @return True if the result is positive, false otherwise.
+   */
   [[nodiscard]] bool is_positive() const noexcept
   {
     return _origin == ResultOrigin::HitPositive or _origin == ResultOrigin::ComputedPositive;
   }
 
-  /** @brief Returns true if the result represents a cached failure/negative. */
+  /**
+   * @brief Returns true if the result represents a cached failure/negative.
+   * @return True if the result is negative, false otherwise.
+   */
   [[nodiscard]] bool is_negative() const noexcept
   {
     return _origin == ResultOrigin::HitNegative or _origin == ResultOrigin::ComputedNegative;
   }
 
-  /** @brief Returns true if the cache was saturated (full of computing entries). */
+  /**
+   * @brief Returns true if the cache was saturated (full of computing entries).
+   * @return True if saturated, false otherwise.
+   */
   [[nodiscard]] bool is_saturated() const noexcept
   {
     return _origin == ResultOrigin::Saturated;
   }
 
-  /** @brief Returns true if the result was a cache hit (positive or negative). */
+  /**
+   * @brief Returns true if the result was a cache hit (positive or negative).
+   * @return True if it was a hit, false otherwise.
+   */
   [[nodiscard]] bool is_hit() const noexcept
   {
     return _origin == ResultOrigin::HitPositive or _origin == ResultOrigin::HitNegative;
   }
 
-  /** @brief Returns true if the result was computed during the current call. */
+  /**
+   * @brief Returns true if the result was computed during the current call.
+   * @return True if computed, false otherwise.
+   */
   [[nodiscard]] bool was_computed() const noexcept
   {
     return _origin == ResultOrigin::ComputedPositive or _origin == ResultOrigin::ComputedNegative;
   }
 
-  /** @brief Returns the internal origin of the result. */
+  /**
+   * @brief Returns the internal origin of the result.
+   * @return The ResultOrigin value.
+   */
   [[nodiscard]] ResultOrigin origin() const noexcept
   {
     return _origin;
