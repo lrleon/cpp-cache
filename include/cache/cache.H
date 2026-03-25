@@ -311,9 +311,6 @@ private:
   alignas(64) std::atomic<size_t> _stat_evictions{0};
   alignas(64) std::atomic<size_t> _stat_saturations{0};
 
-  alignas(64) std::atomic<size_t> _computing_count{
-    0}; /**< Fast track for saturation check (audit fix 3.4). */
-
   // ================================================================
   // LRU helpers (must be called with _mtx held)
   // ================================================================
@@ -461,9 +458,6 @@ private:
     // Key not found -- we need to insert. Evict first if at capacity.
     if (_table.size() == _capacity)
       {
-        if (_computing_count >= _capacity)
-          return {nullptr, false};  // Fast path: avoid O(n) scan when fully saturated (audit fix 3.4)
-
         CacheEntry *victim = find_evictable_lru();
         if (victim == nullptr)
           {
@@ -489,7 +483,6 @@ private:
     // Mark as Computing immediately so the entry is never evictable
     // between insertion and the solver run (fixes audit bug 1.1).
     entry->set_state(EntryState::Computing);
-    ++_computing_count;
 
     // Acquire for caller (refcount: 1 table + 1 caller = 2)
     entry->acquire();
@@ -631,11 +624,6 @@ private:
         // We are the winning thread: mark as Computing and release lock before calling solver.
         // Releasing the lock is vital to allow other threads to access other keys.
         entry->set_state(EntryState::Computing);
-
-        // _computing_count is an atomic hint. Here it's updated outside the global _mtx
-        // so a small imprecision is acceptable. This atomic value is only used for the
-        // saturation fast-path check.
-        ++_computing_count;
       }
 
     // owner == true: entry is already Computing (set in contains_or_insert_locked
@@ -680,8 +668,6 @@ private:
         entry->set_expiration(completion_time + _negative_ttl);
       }
 
-    --_computing_count;
-
     // Signal all waiting threads that the value is now available.
     // Done while holding the entry lock to ensure waiters wake up immediately
     // after unlock, without being delayed by the global _mtx acquisition (audit fix 3.2).
@@ -703,6 +689,20 @@ private:
     return cache_result;
   }
 
+private:
+  /**
+   * @brief Internal helper to validate capacity before member initialization.
+   * @param capacity The capacity to check.
+   * @return The validated capacity.
+   * @throw std::invalid_argument if capacity is zero.
+   */
+  static size_t validate_capacity(size_t capacity)
+  {
+    if (capacity == 0)
+      throw std::invalid_argument("Cache capacity must be greater than zero.");
+    return capacity;
+  }
+
 public:
   static constexpr float table_ratio = 1.3f;
 
@@ -720,7 +720,8 @@ public:
         const std::chrono::seconds &negative_ttl,
         MissSolver solver,
         HashFct hash_fct = default_key_hash)
-    : _capacity(capacity), _table(static_cast<size_t>(table_ratio * capacity),
+    : _capacity(validate_capacity(capacity)),
+      _table(static_cast<size_t>(table_ratio * _capacity),
                                   placeholder_hash,
                                   Cmp(),
                                   0.0f,    // lower_alpha — never shrink
@@ -729,7 +730,6 @@ public:
                                   false),  // with_resize — preallocated, no dynamic resize
       _positive_ttl(positive_ttl), _negative_ttl(negative_ttl), _solver(std::move(solver))
   {
-    assert(capacity > 0);
     _table.set_hash_fct(std::move(hash_fct));
   }
 

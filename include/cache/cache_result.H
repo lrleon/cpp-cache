@@ -7,7 +7,9 @@
 #ifndef CACHE_RESULT_H
 #define CACHE_RESULT_H
 
+#include <cstdint>
 #include <memory>
+#include <utility>
 
 namespace CppCache {
 

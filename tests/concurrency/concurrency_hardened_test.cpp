@@ -26,6 +26,28 @@ using namespace std::chrono;
 using namespace std::chrono_literals;
 using namespace CppCache;
 
+/**
+ * @brief Helper to wait for a condition to become true within a timeout.
+ * @param condition Lambda returning bool.
+ * @param timeout Duration to wait before failing.
+ * @param message Error message on failure.
+ */
+template <typename Func>
+void WaitForConditionOrFail(Func condition,
+                            milliseconds timeout = 5s,
+                            const string &message = "Timeout waiting for condition")
+{
+  auto start = steady_clock::now();
+  while (!condition())
+    {
+      if (steady_clock::now() - start > timeout)
+        {
+          FAIL() << message;
+        }
+      this_thread::sleep_for(100us);
+    }
+}
+
 // ================================================================
 // Section 1: Saturation (all entries Computing)
 // ================================================================
@@ -44,8 +66,8 @@ TEST(SaturationTest, all_computing_returns_valid_result)
       solver_calls.fetch_add(1);
       if (key <= 2)
         {
-          while (!may_finish.load(memory_order_acquire))
-            this_thread::sleep_for(100us);
+          WaitForConditionOrFail([&]() { return may_finish.load(memory_order_acquire); },
+                                 5s, "Solver wait for may_finish timed out");
         }
       return make_shared<int>(key * 10);
     });
@@ -55,8 +77,8 @@ TEST(SaturationTest, all_computing_returns_valid_result)
   auto f2 = async(launch::async, [&]() { return cache.get_or_compute(2); });
 
   // Wait for both solvers to start
-  while (solver_calls.load() < 2)
-    this_thread::sleep_for(100us);
+  WaitForConditionOrFail([&]() { return solver_calls.load() >= 2; },
+                         5s, "Timed out waiting for solver_calls to reach 2");
 
   // All slots are Computing. key=3 should return Saturated.
   auto r3 = cache.get_or_compute(3);
@@ -83,8 +105,8 @@ TEST(SaturationTest, all_threads_get_saturated_result)
     [&](const int &key) -> shared_ptr<int>
     {
       total_solver_calls.fetch_add(1);
-      while (!may_finish.load(memory_order_acquire))
-        this_thread::sleep_for(100us);
+      WaitForConditionOrFail([&]() { return may_finish.load(memory_order_acquire); },
+                             5s, "Solver wait for may_finish timed out");
       return make_shared<int>(key * 10);
     });
 
@@ -92,14 +114,14 @@ TEST(SaturationTest, all_threads_get_saturated_result)
   auto f1 = async(launch::async, [&]() { return cache.get_or_compute(1); });
   auto f2 = async(launch::async, [&]() { return cache.get_or_compute(2); });
 
-  while (total_solver_calls.load() < 2)
-    this_thread::sleep_for(100us);
+  WaitForConditionOrFail([&]() { return total_solver_calls.load() >= 2; },
+                         5s, "Timed out waiting for total_solver_calls to reach 2");
 
   // Launch 10 threads all requesting key=3 under saturation
   constexpr int N = 10;
   vector<future<CacheResult<int>>> futures;
   for (int i = 0; i < N; ++i)
-    futures.push_back(async(launch::async, [&]()
+    futures.push_back(async(launch::async, [&, i]()
     {
       return cache.get_or_compute(3);
     }));
@@ -153,8 +175,8 @@ TEST(TOCTOUBug, empty_entry_evictable_stress)
           if (key == 1)
             {
               key1_started.store(true, memory_order_release);
-              while (!key1_may_finish.load(memory_order_acquire))
-                this_thread::sleep_for(50us);
+              WaitForConditionOrFail([&]() { return key1_may_finish.load(memory_order_acquire); },
+                                     5s, "Solver wait for key1_may_finish timed out");
             }
           return make_shared<int>(key * 10);
         });
@@ -165,8 +187,8 @@ TEST(TOCTOUBug, empty_entry_evictable_stress)
         return cache.get_or_compute(1);
       });
 
-      while (!key1_started.load(memory_order_acquire))
-        this_thread::sleep_for(50us);
+      WaitForConditionOrFail([&]() { return key1_started.load(memory_order_acquire); },
+                             5s, "Timed out waiting for key 1 solver to start");
 
       // Race: two threads insert key=2 and key=3 simultaneously.
       // Cache has capacity=2: key=1 (Computing), one empty slot.
@@ -239,7 +261,7 @@ TEST(TTLRaceTest, concurrent_ttl_expiry_recompute)
   // Stagger launches across the expiry boundary
   for (int i = 0; i < N; ++i)
     {
-      futures.push_back(async(launch::async, [&]()
+      futures.push_back(async(launch::async, [&, i]()
       {
         this_thread::sleep_for(chrono::milliseconds(i * 10));
         return cache.get_or_compute(1);
@@ -284,14 +306,14 @@ TEST(ConcurrentExceptionTest, solver_exception_waiters_get_negative)
   vector<future<CacheResult<int>>> futures;
 
   for (int i = 0; i < N; ++i)
-    futures.push_back(async(launch::async, [&]()
+    futures.push_back(async(launch::async, [&, i]()
     {
       return cache.get_or_compute(1);
     }));
 
   // Wait for at least one solver to start
-  while (!solver_started.load(memory_order_acquire))
-    this_thread::sleep_for(100us);
+  WaitForConditionOrFail([&]() { return solver_started.load(memory_order_acquire); },
+                         5s, "Timed out waiting for solver to start");
 
   // All threads should eventually complete (not hang)
   for (auto &f : futures)
@@ -365,8 +387,8 @@ TEST(FindBlockingTest, find_blocks_on_computing_entry)
     [&](const int &key) -> shared_ptr<int>
     {
       solver_started.store(true, memory_order_release);
-      while (!solver_may_finish.load(memory_order_acquire))
-        this_thread::sleep_for(1ms);
+      WaitForConditionOrFail([&]() { return solver_may_finish.load(memory_order_acquire); },
+                             5s, "Solver wait for solver_may_finish timed out");
       return make_shared<int>(key * 10);
     });
 
@@ -376,8 +398,8 @@ TEST(FindBlockingTest, find_blocks_on_computing_entry)
     return cache.get_or_compute(1);
   });
 
-  while (!solver_started.load(memory_order_acquire))
-    this_thread::sleep_for(100us);
+  WaitForConditionOrFail([&]() { return solver_started.load(memory_order_acquire); },
+                         5s, "Timed out waiting for solver to start");
 
   // find() should block until computation finishes
   auto find_future = async(launch::async, [&]()
@@ -723,8 +745,8 @@ TEST(ComputingProtectionTest, computing_entry_not_evicted_heavy)
         return cache.get_or_compute(1);
       });
 
-      while (!solver_started.load(memory_order_acquire))
-        this_thread::sleep_for(100us);
+      WaitForConditionOrFail([&]() { return solver_started.load(memory_order_acquire); },
+                             5s, "Timed out waiting for solver to start");
 
       // Rapidly insert many keys to force evictions
       for (int k = 2; k <= 20; ++k)
@@ -771,7 +793,7 @@ TEST(ConcurrentNegativeTest, negative_with_expiry_and_retry)
     constexpr int N = 10;
     vector<future<CacheResult<int>>> futures;
     for (int i = 0; i < N; ++i)
-      futures.push_back(async(launch::async, [&]()
+      futures.push_back(async(launch::async, [&, i]()
       {
         return cache.get_or_compute(1);
       }));
@@ -796,7 +818,7 @@ TEST(ConcurrentNegativeTest, negative_with_expiry_and_retry)
     constexpr int N = 10;
     vector<future<CacheResult<int>>> futures;
     for (int i = 0; i < N; ++i)
-      futures.push_back(async(launch::async, [&]()
+      futures.push_back(async(launch::async, [&, i]()
       {
         return cache.get_or_compute(1);
       }));
@@ -1107,7 +1129,7 @@ TEST(ConcurrentEvictionTest, thundering_herd_with_eviction)
   vector<future<CacheResult<int>>> futures;
 
   for (int i = 0; i < N; ++i)
-    futures.push_back(async(launch::async, [&]()
+    futures.push_back(async(launch::async, [&, i]()
     {
       return cache.get_or_compute(42);
     }));

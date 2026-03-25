@@ -9,6 +9,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ----------------------------------------------------------------
 if(SANITIZE)
   set(SAN_FLAGS "-fsanitize=${SANITIZE} -fno-omit-frame-pointer -g")
+  # Aleph-w's LINKNAME_TO_TYPE macro uses manual offsetof via null pointer
+  # arithmetic (dlink.H), which triggers UBSan's null check. Suppress it.
+  if(SANITIZE MATCHES "undefined")
+    set(SAN_FLAGS "${SAN_FLAGS} -fno-sanitize=null")
+  endif()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SAN_FLAGS}")
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${SAN_FLAGS}")
 endif()
@@ -62,3 +67,20 @@ add_test(NAME cache_unit_test COMMAND cache_unit_test)
 add_test(NAME cache_concurrency_test COMMAND cache_concurrency_test)
 add_test(NAME cache_hardened_test COMMAND cache_hardened_test)
 add_test(NAME cache_concurrency_hardened_test COMMAND cache_concurrency_hardened_test)
+
+set_tests_properties(
+    cache_unit_test 
+    cache_concurrency_test 
+    cache_hardened_test 
+    cache_concurrency_hardened_test 
+    PROPERTIES LABELS cpp_cache
+)
+
+# ----------------------------------------------------------------
+# Valgrind concurrency test (NOT in CTest — run manually)
+#
+# Build:  cmake --build build-v2 --target cache_valgrind_test
+# Run:    scripts/run_valgrind.rb  (or directly with valgrind)
+# ----------------------------------------------------------------
+add_executable(cache_valgrind_test EXCLUDE_FROM_ALL tests/valgrind/cache_valgrind_test.cpp)
+target_link_libraries(cache_valgrind_test PRIVATE aleph_w Aleph gtest_main gtest pthread gsl gslcblas)

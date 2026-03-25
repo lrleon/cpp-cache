@@ -618,6 +618,9 @@ proctype PeekRequester()
 init
 {
   atomic {
+    /* Capacity validation: models Cache constructor rejecting zero capacity */
+    assert(CAPACITY > 0);
+
     clear_slot(0);
     clear_slot(1);
 
