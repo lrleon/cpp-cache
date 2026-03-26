@@ -55,7 +55,7 @@ build_and_test() {
     # to avoid including its 280+ tests and examples.
     if ! cmake -DCMAKE_BUILD_TYPE="$build_type" -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF ..; then
         log_error "Configuration failed for $build_type"
-        popd > /dev/null
+        popd > /dev/null || { log_error "popd failed in build_and_test (config failure path)"; return 1; }
         return 1
     fi
 
@@ -63,7 +63,7 @@ build_and_test() {
     log_info "Building $build_type with $CORES cores..."
     if ! cmake --build . -j "$CORES"; then
         log_error "Build failed for $build_type"
-        popd > /dev/null
+        popd > /dev/null || { log_error "popd failed in build_and_test (build failure path)"; return 1; }
         return 1
     fi
 
@@ -73,7 +73,7 @@ build_and_test() {
     # -L cpp_cache ensures we only run tests belonging to this project
     if ! ctest --output-on-failure -L cpp_cache; then
         log_error "Tests failed for $build_type"
-        popd > /dev/null
+        popd > /dev/null || { log_error "popd failed in build_and_test (test failure path)"; return 1; }
         return 1
     fi
 
@@ -82,7 +82,7 @@ build_and_test() {
     local duration=$((end_time - start_time))
     
     log_success "$build_type completed successfully in $duration seconds."
-    popd > /dev/null
+    popd > /dev/null || { log_error "popd failed in build_and_test (success path)"; return 1; }
     return 0
 }
 

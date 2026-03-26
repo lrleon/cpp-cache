@@ -486,8 +486,14 @@ proctype FindRequester(byte myid)
 
 /*
  * Background: simulates TTL expiry and manual invalidation.
- * All guards require rc <= 1: models acquiring entry->mtx()
- * which is blocked when any thread holds an EntryGuard.
+ *
+ * NOTE: TTL aging/expiry in the model is proactive (discrete steps), 
+ * whereas the C++ implementation uses lazy expiry checked on access.
+ *
+ * All guards require rc <= 1: this models mutex acquisition blocking 
+ * (entry->mtx()) rather than the C++ refcount semantics itself. It is a 
+ * conservative abstraction: if rc > 1, some thread might be holding 
+ * the entry mutex or about to take it.
  */
 proctype Background()
 {
@@ -521,7 +527,11 @@ proctype Background()
  * Separated from Background (TTL expiry) to independently verify:
  *   - Computing entries are NEVER invalidated (critical safety)
  *   - Invalidation moves entry to LRU tail
- *   - rc <= 1 guard models entry mutex acquisition
+ *
+ * NOTE: The guard slot_rc <= 1 models the ability to acquire entry->mtx().
+ * This is an intentional over-approximation (rc > 1 might report busy 
+ * even if the mutex is technically free for a brief window during 
+ * EntryGuard construction), ensuring safety against state transitions.
  *
  * MAPPING TO C++:
  *   Guard (rc <= 1)          → std::scoped_lock entry_lock(entry->mtx())

@@ -34,39 +34,27 @@ target_include_directories(aleph_w INTERFACE ${ALEPH_DIR})
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
 # ----------------------------------------------------------------
-# v2 unit tests
+# Test helpers
 # ----------------------------------------------------------------
-add_executable(cache_unit_test tests/unit/cache_test.cpp)
-target_link_libraries(cache_unit_test PRIVATE aleph_w Aleph gtest_main gtest pthread gsl gslcblas)
+function(add_cache_test target_name source_file)
+  add_executable(${target_name} ${source_file})
+  target_link_libraries(${target_name} PRIVATE aleph_w Aleph gtest_main gtest pthread gsl gslcblas)
+  add_test(NAME ${target_name} COMMAND ${target_name})
+endfunction()
 
 # ----------------------------------------------------------------
-# v2 concurrency tests
+# v2 tests
 # ----------------------------------------------------------------
-add_executable(cache_concurrency_test tests/concurrency/concurrency_test.cpp)
-target_link_libraries(cache_concurrency_test PRIVATE aleph_w Aleph gtest_main gtest pthread gsl gslcblas)
-
-# ----------------------------------------------------------------
-# v2 hardened unit tests (edge cases, bug-finding)
-# ----------------------------------------------------------------
-add_executable(cache_hardened_test tests/unit/cache_hardened_test.cpp)
-target_link_libraries(cache_hardened_test PRIVATE aleph_w Aleph gtest_main gtest pthread gsl gslcblas)
-
-# ----------------------------------------------------------------
-# v2 hardened concurrency tests (races, deadlocks, saturation)
-# ----------------------------------------------------------------
-add_executable(cache_concurrency_hardened_test tests/concurrency/concurrency_hardened_test.cpp)
-target_link_libraries(cache_concurrency_hardened_test PRIVATE aleph_w Aleph gtest_main gtest pthread gsl gslcblas)
+add_cache_test(cache_unit_test tests/unit/cache_test.cpp)
+add_cache_test(cache_concurrency_test tests/concurrency/concurrency_test.cpp)
+add_cache_test(cache_hardened_test tests/unit/cache_hardened_test.cpp)
+add_cache_test(cache_concurrency_hardened_test tests/concurrency/concurrency_hardened_test.cpp)
 
 # ----------------------------------------------------------------
 # Testing
 # ----------------------------------------------------------------
 include(CTest)
 enable_testing()
-
-add_test(NAME cache_unit_test COMMAND cache_unit_test)
-add_test(NAME cache_concurrency_test COMMAND cache_concurrency_test)
-add_test(NAME cache_hardened_test COMMAND cache_hardened_test)
-add_test(NAME cache_concurrency_hardened_test COMMAND cache_concurrency_hardened_test)
 
 set_tests_properties(
     cache_unit_test 

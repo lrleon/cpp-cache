@@ -593,9 +593,11 @@ TEST(ValgrindConcurrency, full_api_storm)
   go.store(true, memory_order_release);
   for (auto &t : threads) t.join();
 
-  // Sanity: stats should be internally consistent
+  // Sanity: stats should be internally consistent. 
+  // Since we performed many requests, at least one of these must be > 0.
   auto s = cache.stats();
-  EXPECT_GE(s.hits + s.misses + s.negative_hits + s.saturations, 0u);
+  EXPECT_GT(s.hits + s.misses + s.negative_hits + s.saturations, 0u);
+  EXPECT_LE(cache.size(), static_cast<size_t>(CAPACITY));
 }
 
 // ================================================================

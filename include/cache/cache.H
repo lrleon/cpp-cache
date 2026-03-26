@@ -1079,7 +1079,7 @@ public:
    */
   size_t size() const
   {
-    std::scoped_lock glock(const_cast<std::mutex &>(_mtx));
+    std::scoped_lock glock(_mtx);
     return _table.size();
   }
 

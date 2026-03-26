@@ -48,7 +48,6 @@ def run(cmd, label)
   puts "#{'=' * 60}\n\n"
 
   log_file = File.join(LOG_DIR, "valgrind-#{label}.log")
-  full_cmd = cmd + ['2>&1']
 
   t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
