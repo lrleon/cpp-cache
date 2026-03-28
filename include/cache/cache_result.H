@@ -30,7 +30,7 @@ enum class ResultOrigin : uint8_t
   /** @brief The miss solver just failed; a negative result was cached. */
   ComputedNegative,
 
-  /** @brief The cache is full and all entries are currently Computing. */
+  /** @brief The cache is full and no entry is evictable (all are Computing or held by active references). */
   Saturated
 };
 
@@ -102,7 +102,7 @@ public:
   }
 
   /**
-   * @brief Factory: cache saturated (all entries Computing).
+   * @brief Factory: cache saturated (no evictable slot available).
    * @return A CacheResult representing a saturated cache state.
    */
   static CacheResult saturated()
@@ -129,7 +129,7 @@ public:
   }
 
   /**
-   * @brief Returns true if the cache was saturated (full of computing entries).
+   * @brief Returns true if the cache was saturated (no evictable slot available).
    * @return True if saturated, false otherwise.
    */
   [[nodiscard]] bool is_saturated() const noexcept

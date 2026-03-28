@@ -19,7 +19,27 @@ if(SANITIZE)
 endif()
 
 # Aleph-w
-set(ALEPH_DIR "$ENV{HOME}/Aleph-w" CACHE PATH "Path to Aleph-w")
+if(NOT ALEPH_DIR AND DEFINED ENV{ALEPH_DIR} AND NOT "$ENV{ALEPH_DIR}" STREQUAL "")
+  set(ALEPH_DIR "$ENV{ALEPH_DIR}")
+endif()
+
+if(NOT ALEPH_DIR)
+  foreach(candidate
+      "${CMAKE_SOURCE_DIR}/../Aleph-w"
+      "${CMAKE_SOURCE_DIR}/../../Aleph-w"
+      "$ENV{HOME}/Aleph-w")
+    if(EXISTS "${candidate}/CMakeLists.txt")
+      set(ALEPH_DIR "${candidate}")
+      break()
+    endif()
+  endforeach()
+endif()
+
+set(ALEPH_DIR "${ALEPH_DIR}" CACHE PATH "Path to Aleph-w")
+
+if(NOT ALEPH_DIR OR NOT EXISTS "${ALEPH_DIR}/CMakeLists.txt")
+  message(FATAL_ERROR "ALEPH_DIR must point to an Aleph-w checkout containing CMakeLists.txt")
+endif()
 
 # Al tener su propio CMakeLists.txt, podemos incluirlo como un subproyecto.
 # Esto hace que CMake se encargue de compilar Aleph automáticamente antes 

@@ -341,9 +341,10 @@ TEST(ValgrindConcurrency, ttl_expiry_recompute_race)
           auto result = cache.get_or_compute(1);
           if (result.is_positive())
             EXPECT_EQ(*result.value(), 10);
-          // Sleep long enough for some TTLs to expire
+          // Force a full idle gap that exceeds the 1s TTL so the
+          // next get_or_compute(1) must recompute at least once.
           if (r % 5 == 0)
-            this_thread::sleep_for(200ms);
+            this_thread::sleep_for(1100ms);
         }
     });
 
@@ -351,7 +352,7 @@ TEST(ValgrindConcurrency, ttl_expiry_recompute_race)
   for (auto &t : threads) t.join();
 
   // At least one recomputation must have happened
-  EXPECT_GE(compute_count.load(), 1);
+  EXPECT_GE(compute_count.load(), 2);
 }
 
 // ================================================================
@@ -400,7 +401,7 @@ TEST(ValgrindConcurrency, saturation_all_computing)
   for (auto &f : saturators)
     {
       auto result = f.get();
-      EXPECT_TRUE(result.is_saturated() or result.is_positive());
+      EXPECT_TRUE(result.is_saturated());
     }
 
   solvers_may_finish.store(true, memory_order_release);
@@ -445,18 +446,49 @@ TEST(ValgrindConcurrency, solver_exception_concurrent_waiters)
 
   go.store(true, memory_order_release);
 
-  int positive = 0, negative = 0;
+  int computed_negative = 0;
+  int hit_negative = 0;
   for (auto &f : futures)
     {
+      auto status = f.wait_for(10s);
+      ASSERT_EQ(status, future_status::ready)
+        << "Thread hung waiting for solver failure to propagate";
+
       auto result = f.get();
-      if (result.is_positive())
-        ++positive;
-      else if (result.is_negative())
-        ++negative;
+      ASSERT_TRUE(result.is_negative())
+        << "Solver exception should produce a negative result for all waiters";
+
+      if (result.origin() == ResultOrigin::ComputedNegative)
+        ++computed_negative;
+      else if (result.origin() == ResultOrigin::HitNegative)
+        ++hit_negative;
     }
 
-  // At least one result must exist (positive or negative)
-  EXPECT_GT(positive + negative, 0);
+  EXPECT_EQ(call_count.load(), 1);
+  EXPECT_EQ(computed_negative, 1);
+  EXPECT_EQ(hit_negative, T - 1);
+
+  // The failed entry should remain cached and visible via non-refreshing APIs.
+  EXPECT_TRUE(cache.has(1));
+  auto cached = cache.peek(1);
+  ASSERT_TRUE(cached.has_value());
+  EXPECT_TRUE(cached->is_negative());
+  EXPECT_TRUE(cached->is_hit());
+  EXPECT_EQ(cached->origin(), ResultOrigin::HitNegative);
+
+  // Still within the configured 10s negative TTL, so the cached failure
+  // should remain valid and get_or_compute() must not reinvoke the solver.
+  this_thread::sleep_for(1s);
+  EXPECT_TRUE(cache.has(1));
+  auto still_cached = cache.peek(1);
+  ASSERT_TRUE(still_cached.has_value());
+  EXPECT_TRUE(still_cached->is_negative());
+
+  auto retry = cache.get_or_compute(1);
+  EXPECT_TRUE(retry.is_negative());
+  EXPECT_TRUE(retry.is_hit());
+  EXPECT_EQ(retry.origin(), ResultOrigin::HitNegative);
+  EXPECT_EQ(call_count.load(), 1);
 }
 
 // ================================================================

@@ -63,6 +63,7 @@ byte  slot_key[CAPACITY];
 bool  slot_expired[CAPACITY];
 byte  slot_rank[CAPACITY];
 byte  slot_rc[CAPACITY];      /* refcount */
+bool  slot_locked[CAPACITY];  /* explicit mutex state */
 byte  slot_age[CAPACITY];     /* TTL age: expires when >= AGE_THRESHOLD */
 byte  computing_count = 0;
 
@@ -73,7 +74,6 @@ bool key_invalidated[NKEYS];
 
 bool ever_stored[NKEYS];
 bool request_done[NTHREADS];
-bool retry_pending[NTHREADS];
 mtype request_result[NTHREADS];
 byte target_key[NTHREADS];
 
@@ -84,6 +84,7 @@ inline clear_slot(s)
   slot_expired[s] = false;
   slot_rank[s] = 0;
   slot_rc[s] = 0;
+  slot_locked[s] = false;
   slot_age[s] = 0
 }
 
@@ -177,11 +178,6 @@ inline assert_consistent()
   assert(!(slot_state[1] == Computing && slot_rc[1] < 2));
   assert(slot_rc[0] <= NTHREADS + 1);
   assert(slot_rc[1] <= NTHREADS + 1);
-  /* Background requires rc<=1; so expired/invalidated → rc<=1 */
-  assert(!(slot_expired[0] && slot_rc[0] > 1));
-  assert(!(slot_expired[1] && slot_rc[1] > 1));
-  assert(!(slot_state[0] == Invalidated && slot_rc[0] > 1));
-  assert(!(slot_state[1] == Invalidated && slot_rc[1] > 1));
 
   /* LRU rank invariants */
   if
@@ -208,6 +204,163 @@ inline refresh_and_check()
  * Requester: models a thread calling get_or_compute().
  * Three-phase structure with explicit refcount acquire/release.
  */
+/*
+ * get_or_compute_api: models a single call to get_or_compute().
+ * Sets request_done[myid] = true on completion (including Saturation).
+ */
+inline get_or_compute_api(myid, mykey, sid, is_owner)
+{
+  sid = NONE;
+  is_owner = false;
+
+  /*
+   * PHASE 1: SEARCH / INSERT
+   * Models contains_or_insert_locked() under global _mtx.
+   * Acquires refcount on found/created entry.
+   */
+  atomic {
+    /* Search hash table for key */
+    if
+    :: slot_key[0] == mykey && OCCUPIED(0) -> sid = 0
+    :: slot_key[1] == mykey && OCCUPIED(1) -> sid = 1
+    :: else -> skip
+    fi;
+
+    if
+    :: sid != NONE ->
+       /* Key found in slot sid */
+       if
+       :: slot_state[sid] == Computing ||
+          (MATERIALIZED(sid) && !slot_expired[sid]) ->
+          /* Valid or being computed: acquire ref, proceed to Phase 3 */
+          slot_rc[sid]++;
+          move_to_mru(sid)
+       :: slot_state[sid] == Invalidated ||
+          (MATERIALIZED(sid) && slot_expired[sid]) ->
+          /* Stale entry: reinstall as Computing (same slot, same key) */
+          slot_rc[sid]++;
+          slot_state[sid] = Computing;
+          slot_expired[sid] = false;
+          computing_count++;
+          move_to_mru(sid);
+          is_owner = true
+       fi
+
+    :: else ->
+       /* Key not found. Find empty or evictable slot. */
+       if
+       :: !OCCUPIED(0) -> sid = 0
+       :: OCCUPIED(0) && !OCCUPIED(1) -> sid = 1
+       :: FULL() &&
+          slot_state[0] != Computing && slot_rc[0] <= 1 &&
+          (UNEVICTABLE(1) || slot_rank[0] == 0) ->
+          sid = 0
+       :: FULL() &&
+          slot_state[1] != Computing && slot_rc[1] <= 1 &&
+          (UNEVICTABLE(0) || slot_rank[1] == 0) ->
+          sid = 1
+       :: else -> skip
+       fi;
+
+       if
+       :: sid == NONE ->
+          request_result[myid] = Saturated;
+          request_done[myid] = true
+       :: else ->
+          install_computing(sid, mykey);
+          is_owner = true
+       fi
+    fi;
+    refresh_and_check()
+  } /* end Phase 1 atomic */
+
+  if
+  :: request_done[myid] -> skip   /* Saturated — terminal for this call */
+  :: sid == NONE -> skip         /* Internal retry (Phase 1 skipped due to race) */
+  :: else ->
+
+     /*
+      * PHASE 2: SOLVER EXECUTION (owner only)
+      */
+     if
+     :: is_owner ->
+        skip;   /* solver work — non-atomic interleaving point */
+        atomic {
+          /* Completion under entry lock */
+          slot_locked[sid] = true;
+          if :: slot_state[sid] = Ready :: slot_state[sid] = Failed fi;
+          slot_expired[sid] = false;
+          computing_count--;
+          move_to_mru(sid);
+          ever_stored[mykey] = true;
+          refresh_and_check();
+          slot_locked[sid] = false
+        }
+     :: else -> skip
+     fi;
+
+     /*
+      * PHASE 3: HARVEST / WAIT
+      */
+     atomic {
+       slot_locked[sid] = true;
+       if
+       :: slot_key[sid] == mykey && slot_state[sid] == Computing ->
+          slot_locked[sid] = false;
+          slot_state[sid] != Computing;
+          slot_locked[sid] = true;
+          if
+          :: slot_state[sid] == Ready ->
+             request_result[myid] = HitPositive;
+             request_done[myid] = true;
+             ever_stored[mykey] = true;
+             slot_age[sid] = 0;
+             move_to_mru(sid)
+          :: slot_state[sid] == Failed ->
+             request_result[myid] = HitNegative;
+             request_done[myid] = true;
+             ever_stored[mykey] = true;
+             slot_age[sid] = 0;
+             move_to_mru(sid)
+          fi
+
+       :: slot_key[sid] == mykey &&
+          slot_state[sid] == Ready && !slot_expired[sid] ->
+          if
+          :: is_owner -> request_result[myid] = ComputedPositive
+          :: else     -> request_result[myid] = HitPositive
+          fi;
+          request_done[myid] = true;
+          ever_stored[mykey] = true;
+          slot_age[sid] = 0;
+          move_to_mru(sid)
+
+       :: slot_key[sid] == mykey &&
+          slot_state[sid] == Failed && !slot_expired[sid] ->
+          if
+          :: is_owner -> request_result[myid] = ComputedNegative
+          :: else     -> request_result[myid] = HitNegative
+          fi;
+          request_done[myid] = true;
+          ever_stored[mykey] = true;
+          slot_age[sid] = 0;
+          move_to_mru(sid)
+
+       :: else ->
+          /* Entry was unexpectedly modified. Bail out, retry. */
+          skip
+       fi;
+
+       /* Release reference (EntryGuard destructor) */
+       assert(slot_rc[sid] > 0);
+       slot_rc[sid]--;
+       is_owner = false;
+       refresh_and_check();
+       slot_locked[sid] = false
+     } /* end Phase 3 atomic */
+  fi
+}
+
 proctype Requester(byte myid)
 {
   byte mykey = target_key[myid];
@@ -215,172 +368,15 @@ proctype Requester(byte myid)
   bool is_owner;
 
   do
-  :: request_done[myid] -> break
-
-  /* Retry after saturation: wait until some slot becomes evictable */
-  :: atomic {
-       !request_done[myid] &&
-       retry_pending[myid] && !ALL_BLOCKED() ->
-       retry_pending[myid] = false;
-       refresh_and_check()
-     }
-
-  :: atomic {
-       !request_done[myid] && !retry_pending[myid] ->
-       sid = NONE;
-       is_owner = false;
-
-       /*
-        * PHASE 1: SEARCH / INSERT
-        * Models contains_or_insert_locked() under global _mtx.
-        * Acquires refcount on found/created entry.
-        */
-
-       /* Search hash table for key */
-       if
-       :: slot_key[0] == mykey && OCCUPIED(0) -> sid = 0
-       :: slot_key[1] == mykey && OCCUPIED(1) -> sid = 1
-       :: else -> skip
-       fi;
-
-       if
-       :: sid != NONE ->
-          /* Key found in slot sid */
-          if
-          :: slot_state[sid] == Computing ||
-             (MATERIALIZED(sid) && !slot_expired[sid]) ->
-             /* Valid or being computed: acquire ref, proceed to Phase 3 */
-             slot_rc[sid]++;
-             move_to_mru(sid)
-          :: slot_state[sid] == Invalidated ||
-             (MATERIALIZED(sid) && slot_expired[sid]) ->
-             /* Stale entry: reinstall as Computing (same slot, same key) */
-             assert(slot_rc[sid] == 1);
-             slot_state[sid] = Computing;
-             slot_expired[sid] = false;
-             slot_rc[sid] = 2;
-             computing_count++;
-             move_to_mru(sid);
-             is_owner = true
-          fi
-
-       :: else ->
-          /* Key not found. Find empty or evictable slot. */
-          if
-          :: !OCCUPIED(0) -> sid = 0
-          :: OCCUPIED(0) && !OCCUPIED(1) -> sid = 1
-          :: FULL() &&
-             slot_state[0] != Computing && slot_rc[0] <= 1 &&
-             (UNEVICTABLE(1) || slot_rank[0] == 0) ->
-             sid = 0
-          :: FULL() &&
-             slot_state[1] != Computing && slot_rc[1] <= 1 &&
-             (UNEVICTABLE(0) || slot_rank[1] == 0) ->
-             sid = 1
-          :: else -> skip
-          fi;
-
-          if
-          :: sid == NONE ->
-             request_result[myid] = Saturated;
-             retry_pending[myid] = true
-          :: else ->
-             install_computing(sid, mykey);
-             is_owner = true
-          fi
-       fi;
-       refresh_and_check()
-     } /* end Phase 1 atomic */
-
+  :: !request_done[myid] ->
+     get_or_compute_api(myid, mykey, sid, is_owner);
      if
-     :: sid == NONE -> skip   /* Saturated — will retry */
-     :: else ->
-
-        /*
-         * PHASE 2: SOLVER EXECUTION (owner only)
-         * Models MissSolver callback. No locks held.
-         * The skip creates an interleaving point (other threads run).
-         * Refcount (rc>=2) protects slot from eviction/Background.
-         */
-        if
-        :: is_owner ->
-           skip;   /* solver work — non-atomic interleaving point */
-           atomic {
-             /* Completion under entry lock */
-             if :: slot_state[sid] = Ready :: slot_state[sid] = Failed fi;
-             slot_expired[sid] = false;
-             computing_count--;
-             move_to_mru(sid);
-             ever_stored[mykey] = true;
-             refresh_and_check()
-           }
-        :: else -> skip
-        fi;
-
-        /*
-         * PHASE 3: HARVEST / WAIT
-         * Models resolve_hit() / end of resolve_miss() under entry lock.
-         * Waits on CV if entry is still Computing.
-         * Always releases refcount on exit.
-         */
-        atomic {
-          if
-          :: slot_key[sid] == mykey && slot_state[sid] == Computing ->
-             /* CV wait: block until owner completes.
-              * Atomicity is suspended during the wait; resumes when
-              * state changes. Refcount guarantees no eviction/Background
-              * interference, so state MUST become Ready or Failed. */
-             slot_state[sid] != Computing;
-             assert(slot_state[sid] == Ready || slot_state[sid] == Failed);
-             if
-             :: slot_state[sid] == Ready ->
-                request_result[myid] = HitPositive;
-                request_done[myid] = true;
-                ever_stored[mykey] = true;
-                slot_age[sid] = 0;
-                move_to_mru(sid)
-             :: slot_state[sid] == Failed ->
-                request_result[myid] = HitNegative;
-                request_done[myid] = true;
-                ever_stored[mykey] = true;
-                slot_age[sid] = 0;
-                move_to_mru(sid)
-             fi
-
-          :: slot_key[sid] == mykey &&
-             slot_state[sid] == Ready && !slot_expired[sid] ->
-             if
-             :: is_owner -> request_result[myid] = ComputedPositive
-             :: else     -> request_result[myid] = HitPositive
-             fi;
-             request_done[myid] = true;
-             ever_stored[mykey] = true;
-             slot_age[sid] = 0;
-             move_to_mru(sid)
-
-          :: slot_key[sid] == mykey &&
-             slot_state[sid] == Failed && !slot_expired[sid] ->
-             if
-             :: is_owner -> request_result[myid] = ComputedNegative
-             :: else     -> request_result[myid] = HitNegative
-             fi;
-             request_done[myid] = true;
-             ever_stored[mykey] = true;
-             slot_age[sid] = 0;
-             move_to_mru(sid)
-
-          :: else ->
-             /* Entry was unexpectedly modified. Bail out, retry. */
-             skip
-          fi;
-
-          /* Release reference (EntryGuard destructor) */
-          assert(slot_rc[sid] > 0);
-          slot_rc[sid]--;
-          is_owner = false;
-          refresh_and_check()
-        } /* end Phase 3 atomic */
+     :: request_result[myid] == Saturated ->
+        request_done[myid] = false;
+        atomic { !ALL_BLOCKED() -> skip }
+     :: else -> break
      fi
+  :: request_done[myid] -> break
   od
 }
 
@@ -447,38 +443,42 @@ proctype FindRequester(byte myid)
          * If Ready/Failed: harvest result immediately.
          */
         atomic {
+          slot_locked[sid] = true;
           if
-          :: slot_state[sid] == Computing ->
-             /* CV wait: block until owner completes solver.
-              * Atomicity is suspended during the wait; resumes when
-              * state changes. Refcount guarantees the slot is stable. */
+          :: slot_key[sid] == mykey && slot_state[sid] == Computing ->
+             slot_locked[sid] = false;
              slot_state[sid] != Computing;
-             assert(slot_state[sid] == Ready || slot_state[sid] == Failed);
+             slot_locked[sid] = true;
              if
-             :: slot_state[sid] == Ready ->
+             :: slot_key[sid] == mykey && slot_state[sid] == Ready ->
                 request_result[myid] = HitPositive;
                 slot_age[sid] = 0;
                 move_to_mru(sid)
-             :: slot_state[sid] == Failed ->
+             :: slot_key[sid] == mykey && slot_state[sid] == Failed ->
                 request_result[myid] = HitNegative;
                 slot_age[sid] = 0;
                 move_to_mru(sid)
+             :: else -> skip
              fi
-          :: slot_state[sid] == Ready && !slot_expired[sid] ->
+          :: slot_key[sid] == mykey &&
+             slot_state[sid] == Ready && !slot_expired[sid] ->
              request_result[myid] = HitPositive;
              slot_age[sid] = 0;
              move_to_mru(sid)
-          :: slot_state[sid] == Failed && !slot_expired[sid] ->
+          :: slot_key[sid] == mykey &&
+             slot_state[sid] == Failed && !slot_expired[sid] ->
              request_result[myid] = HitNegative;
              slot_age[sid] = 0;
              move_to_mru(sid)
+          :: else -> skip
           fi;
 
           /* Release reference (EntryGuard destructor) */
           request_done[myid] = true;
           assert(slot_rc[sid] > 0);
           slot_rc[sid]--;
-          refresh_and_check()
+          refresh_and_check();
+          slot_locked[sid] = false
         } /* end Phase 2 atomic */
      fi
   od
@@ -502,22 +502,26 @@ proctype Background()
    * Models steady_clock advancing: entry must age AGE_THRESHOLD ticks
    * without a hit before expiring. Hits reset age to 0. */
   :: atomic {
-       MATERIALIZED(0) && !slot_expired[0] && slot_rc[0] <= 1 ->
+       MATERIALIZED(0) && !slot_expired[0] && !slot_locked[0] ->
+       slot_locked[0] = true;
        slot_age[0]++;
        if
        :: slot_age[0] >= AGE_THRESHOLD -> slot_expired[0] = true
        :: else -> skip
        fi;
-       refresh_and_check()
+       refresh_and_check();
+       slot_locked[0] = false
      }
   :: atomic {
-       MATERIALIZED(1) && !slot_expired[1] && slot_rc[1] <= 1 ->
+       MATERIALIZED(1) && !slot_expired[1] && !slot_locked[1] ->
+       slot_locked[1] = true;
        slot_age[1]++;
        if
        :: slot_age[1] >= AGE_THRESHOLD -> slot_expired[1] = true
        :: else -> skip
        fi;
-       refresh_and_check()
+       refresh_and_check();
+       slot_locked[1] = false
      }
   od
 }
@@ -544,22 +548,31 @@ proctype Invalidator()
   end: do
   :: atomic {
        slot_state[0] != Empty && slot_state[0] != Computing &&
-       slot_state[0] != Invalidated && slot_rc[0] <= 1 ->
+       slot_state[0] != Invalidated && !slot_locked[0] ->
+       /* EntryGuard(entry) and entry_lock(entry->mtx()) */
+       slot_rc[0]++;
+       slot_locked[0] = true;
        /* CRITICAL: Computing entries must never be invalidated */
        assert(slot_state[0] != Computing);
        slot_state[0] = Invalidated;
        slot_expired[0] = true;
        move_to_lru(0);
-       refresh_and_check()
+       refresh_and_check();
+       slot_locked[0] = false;
+       slot_rc[0]--
      }
   :: atomic {
        slot_state[1] != Empty && slot_state[1] != Computing &&
-       slot_state[1] != Invalidated && slot_rc[1] <= 1 ->
+       slot_state[1] != Invalidated && !slot_locked[1] ->
+       slot_rc[1]++;
+       slot_locked[1] = true;
        assert(slot_state[1] != Computing);
        slot_state[1] = Invalidated;
        slot_expired[1] = true;
        move_to_lru(1);
-       refresh_and_check()
+       refresh_and_check();
+       slot_locked[1] = false;
+       slot_rc[1]--
      }
   od
 }
@@ -578,16 +591,24 @@ proctype TouchRequester()
 {
   end: do
   :: atomic {
-       MATERIALIZED(0) && !slot_expired[0] && slot_rc[0] <= 1 ->
+       MATERIALIZED(0) && !slot_expired[0] && !slot_locked[0] ->
+       slot_rc[0]++;
+       slot_locked[0] = true;
        slot_age[0] = 0;
        move_to_mru(0);
-       refresh_and_check()
+       refresh_and_check();
+       slot_locked[0] = false;
+       slot_rc[0]--
      }
   :: atomic {
-       MATERIALIZED(1) && !slot_expired[1] && slot_rc[1] <= 1 ->
+       MATERIALIZED(1) && !slot_expired[1] && !slot_locked[1] ->
+       slot_rc[1]++;
+       slot_locked[1] = true;
        slot_age[1] = 0;
        move_to_mru(1);
-       refresh_and_check()
+       refresh_and_check();
+       slot_locked[1] = false;
+       slot_rc[1]--
      }
   od
 }
@@ -599,7 +620,7 @@ proctype TouchRequester()
  * which guarantees peek never blocks by construction.
  *
  * MAPPING TO C++:
- *   Guard (rc <= 1)            → std::unique_lock(mtx, std::try_to_lock)
+ *   Guard (!slot_locked)       → std::unique_lock(mtx, std::try_to_lock)
  *   MATERIALIZED + !expired    → is_valid_hit() check
  *   atomic acquire+release     → EntryGuard RAII within the lock scope
  *   No state modification      → peek() is read-only
@@ -608,17 +629,21 @@ proctype PeekRequester()
 {
   end: do
   :: atomic {
-       MATERIALIZED(0) && !slot_expired[0] && slot_rc[0] <= 1 ->
-       /* Atomic peek: acquire ref, read, release — no state change */
+       MATERIALIZED(0) && !slot_expired[0] && !slot_locked[0] ->
+       /* Atomic peek: acquire ref, lock, read, unlock, release */
        slot_rc[0]++;
+       slot_locked[0] = true;
        assert(slot_state[0] == Ready || slot_state[0] == Failed);
+       slot_locked[0] = false;
        slot_rc[0]--;
        refresh_and_check()
      }
   :: atomic {
-       MATERIALIZED(1) && !slot_expired[1] && slot_rc[1] <= 1 ->
+       MATERIALIZED(1) && !slot_expired[1] && !slot_locked[1] ->
        slot_rc[1]++;
+       slot_locked[1] = true;
        assert(slot_state[1] == Ready || slot_state[1] == Failed);
+       slot_locked[1] = false;
        slot_rc[1]--;
        refresh_and_check()
      }
@@ -639,16 +664,16 @@ init
     /* Scenario: Threads 0,1 compete for key 0 (thundering herd).
      * Thread 2 wants key 1, Thread 3 wants key 2.
      * With CAPACITY=2, forces eviction, saturation, and contention. */
-    target_key[0] = 0; request_done[0] = false; retry_pending[0] = false; request_result[0] = Saturated;
-    target_key[1] = 0; request_done[1] = false; retry_pending[1] = false; request_result[1] = Saturated;
-    target_key[2] = 1; request_done[2] = false; retry_pending[2] = false; request_result[2] = Saturated;
-    target_key[3] = 2; request_done[3] = false; retry_pending[3] = false; request_result[3] = Saturated;
+    target_key[0] = 0; request_done[0] = false; request_result[0] = Saturated;
+    target_key[1] = 0; request_done[1] = false; request_result[1] = Saturated;
+    target_key[2] = 1; request_done[2] = false; request_result[2] = Saturated;
+    target_key[3] = 2; request_done[3] = false; request_result[3] = Saturated;
 
     /* FindRequester threads: find() on keys 0 and 1.
      * Thread 4 targets key 0 (interacts with thundering herd on threads 0,1).
      * Thread 5 targets key 1 (interacts with Requester thread 2). */
-    target_key[4] = 0; request_done[4] = false; retry_pending[4] = false; request_result[4] = Saturated;
-    target_key[5] = 1; request_done[5] = false; retry_pending[5] = false; request_result[5] = Saturated;
+    target_key[4] = 0; request_done[4] = false; request_result[4] = Saturated;
+    target_key[5] = 1; request_done[5] = false; request_result[5] = Saturated;
 
     refresh_and_check();
 

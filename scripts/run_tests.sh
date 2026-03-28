@@ -30,6 +30,11 @@ function log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+CMAKE_ARGS=()
+if [ -n "${ALEPH_DIR:-}" ]; then
+    CMAKE_ARGS+=("-DALEPH_DIR=${ALEPH_DIR}")
+fi
+
 # Function to build and test
 # Returns 0 on success, non-zero on failure.
 build_and_test() {
@@ -53,7 +58,7 @@ build_and_test() {
     log_info "Configuring $build_type..."
     # -DBUILD_TESTS=OFF and -DBUILD_EXAMPLES=OFF are passed to Aleph-w 
     # to avoid including its 280+ tests and examples.
-    if ! cmake -DCMAKE_BUILD_TYPE="$build_type" -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF ..; then
+    if ! cmake -DCMAKE_BUILD_TYPE="$build_type" -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF "${CMAKE_ARGS[@]}" ..; then
         log_error "Configuration failed for $build_type"
         popd > /dev/null || { log_error "popd failed in build_and_test (config failure path)"; return 1; }
         return 1

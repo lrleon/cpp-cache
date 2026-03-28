@@ -14,7 +14,7 @@ cc -O2 -DNFAIR=8 -DMEMLIM=4096 -o "$PAN" pan.c
 
 echo ""
 echo "=== [1/2] Safety verification (assertions) ==="
-"$PAN" -n -E
+"$PAN" -m100000 -n -E
 echo "  Safety: PASSED"
 
 echo ""
@@ -25,10 +25,12 @@ for prop in \
   no_starvation_thread1 \
   no_starvation_thread2 \
   no_starvation_thread3 \
+  no_starvation_thread4 \
+  no_starvation_thread5 \
   all_terminate
 do
   echo -n "  - $prop ... "
-  if "$PAN" -n -E -a -f -N "$prop" 2>&1 | grep -q "errors: 0"; then
+  if "$PAN" -m100000 -n -E -a -f -N "$prop" 2>&1 | grep -q "errors: 0"; then
     echo "PASSED"
   else
     echo "FAILED"

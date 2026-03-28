@@ -8,7 +8,7 @@
 // - Caches both positive and negative results with separate TTLs
 // - Uses shared_ptr for safe value lifetime management
 // - Supports lazy invalidation
-// - Never evicts entries in Computing state
+// - Never evicts entries in Computing state or held by active threads
 // - Uses LRU eviction policy
 //
 // Reuses Aleph-w: LhashTableVtl for hash table, Dlink for LRU list
@@ -45,7 +45,7 @@ struct CacheStats
   size_t misses = 0;        /**< Lookups that required computing the value. */
   size_t negative_hits = 0; /**< Successful lookups of previously cached failures. */
   size_t evictions = 0;     /**< Number of entries evicted by LRU policy. */
-  size_t saturations = 0;   /**< Failures due to all entries being in Computing state. */
+  size_t saturations = 0;   /**< Failures due to no evictable slot (all entries are Computing or held by active references). */
 };
 
 /**
@@ -57,8 +57,8 @@ struct CacheStats
  * - **Single-Flight:** Only one thread computes a missing key; others wait for the result.
  * - **Negative Caching:** Supports caching failures (nullptr results) with a separate TTL.
  * - **LRU Eviction:** Automatically evicts least recently used entries when capacity is reached.
- * - **Saturation Protection:** Does not evict entries currently being computed, preventing
- *   infinite recursion or resource exhaustion.
+ * - **Saturation Protection:** Never evicts entries that are currently being computed or
+ *   held by active threads (refcount > 1), preventing infinite recursion or resource exhaustion.
  * - **Thread-Safe:** Uses a combination of a global mutex for structural changes and
  *   per-entry mutexes for fine-grained coordination.
  *
@@ -348,11 +348,12 @@ private:
   /**
    * @brief Identifies the best candidate for eviction.
    *
-   * We walk the LRU list starting from the oldest entry. Crucially, we skip any
-   * entry that is currently Computing. This prevents "saturation" issues where
-   * an entry we are currently waiting on is evicted before it can finish.
+   * We walk the LRU list starting from the oldest entry. An entry is evictable
+   * only if it is not Computing and its refcount is <= 1 (no active thread
+   * references). This prevents evicting entries that another thread is waiting
+   * on or actively using.
    *
-   * @return A pointer to the victim entry, or nullptr if all entries are busy.
+   * @return A pointer to the victim entry, or nullptr if no entry is evictable.
    * @note Requires _mtx to be held by the caller.
    */
   CacheEntry *find_evictable_lru() const
@@ -461,8 +462,9 @@ private:
         CacheEntry *victim = find_evictable_lru();
         if (victim == nullptr)
           {
-            // Critical case: all entries are currently Computing.
-            // We cannot evict them because it would break the single-flight guarantee.
+            // No evictable slot: every entry is either Computing or held by
+            // an active thread (refcount > 1). Evicting any of them would break
+            // single-flight guarantees or cause use-after-free.
             return {nullptr, false};
           }
         remove_entry(victim);
@@ -793,7 +795,7 @@ public:
 
     if (entry == nullptr)
       {
-        // Handle cache saturation: all slots are busy with long-running computations.
+        // No evictable slot: all entries are Computing or held by active references.
         _stat_saturations.fetch_add(1, std::memory_order_relaxed);
         return CacheResult<Value>::saturated();
       }
