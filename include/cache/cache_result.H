@@ -165,15 +165,24 @@ public:
   }
 
   /**
-   * @brief Returns the cached value.
-   * @return A shared_ptr to the value (non-null only if is_positive() is true).
+   * @brief Returns the cached value (lvalue overload).
+   * @return A const-reference to the shared_ptr containing the value.
    * @warning If multiple threads access this value concurrently and mutate it,
    * the user must ensure the Value type is thread-safe. The cache does not
    * protect against data races on the Value itself.
    */
-  const std::shared_ptr<Value> &value() const noexcept
+  const std::shared_ptr<Value>& value() const& noexcept
   {
     return _value;
+  }
+
+  /**
+   * @brief Returns the cached value (rvalue overload).
+   * @return A shared_ptr to the value by value (moving or copying).
+   */
+  std::shared_ptr<Value> value() && noexcept
+  {
+    return std::move(_value);
   }
 
   /** @brief Convenience operator for boolean contexts; true if positive. */

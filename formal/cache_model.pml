@@ -241,6 +241,7 @@ inline get_or_compute_api(myid, mykey, sid, is_owner)
           slot_rc[sid]++;
           slot_state[sid] = Computing;
           slot_expired[sid] = false;
+          slot_age[sid] = 0;
           computing_count++;
           move_to_mru(sid);
           is_owner = true
@@ -307,7 +308,7 @@ inline get_or_compute_api(myid, mykey, sid, is_owner)
        if
        :: slot_key[sid] == mykey && slot_state[sid] == Computing ->
           slot_locked[sid] = false;
-          slot_state[sid] != Computing;
+          slot_state[sid] != Computing && !slot_locked[sid] ->
           slot_locked[sid] = true;
           if
           :: slot_state[sid] == Ready ->
@@ -447,7 +448,7 @@ proctype FindRequester(byte myid)
           if
           :: slot_key[sid] == mykey && slot_state[sid] == Computing ->
              slot_locked[sid] = false;
-             slot_state[sid] != Computing;
+             slot_state[sid] != Computing && !slot_locked[sid] ->
              slot_locked[sid] = true;
              if
              :: slot_key[sid] == mykey && slot_state[sid] == Ready ->
