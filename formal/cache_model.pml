@@ -1,8 +1,18 @@
 /*
- * Promela model of cpp-cache with explicit refcount (v4).
+ * Promela model of cpp-cache with explicit refcount (v5).
  *
- * Replaces the boolean slot_fresh[] from v3 with a byte slot_rc[] counter,
- * faithfully modeling CacheEntry::_refcount and EntryGuard RAII lifetime.
+ * CHANGES FROM v4:
+ *   - Phase 1 no longer transitions expired/Invalidated entries to Computing.
+ *     Instead, it acquires refcount and defers state handling to Phase 2
+ *     (resolve_hit under entry lock), faithfully modeling the C++ flow where
+ *     contains_or_insert_locked() returns {entry, true} regardless of state.
+ *   - Background/Invalidator/TouchRequester/PeekRequester no longer require
+ *     slot_rc <= 1.  They only require !slot_locked (entry mutex free),
+ *     correctly decoupling refcount from entry-lock availability as in C++.
+ *   - Added HasRequester process modeling has() API.
+ *   - Added liveness: no_orphaned_computing, saturation_transient.
+ *   - Removed spurious move_to_mru from hit harvest — matches C++ where
+ *     move_to_mru for get_or_compute hits is only in contains_or_insert_locked.
  *
  * REFCOUNT SEMANTICS:
  *   slot_rc[s] == 0  →  slot is free (Empty)
@@ -13,16 +23,15 @@
  *   - Empty → rc == 0
  *   - Occupied → rc >= 1
  *   - Computing → rc >= 2 (table + owner who installed it)
- *   - Expired → rc <= 1 (Background needs entry lock, blocked by holders)
- *   - Invalidated → rc <= 1 (same reason)
  *   - Eviction requires rc <= 1 (no holders: models refcount==1 check)
- *   - Background requires rc <= 1 (entry lock free: models try_lock success)
+ *   - Entry lock (!slot_locked) is independent of refcount
+ *   - Background/Invalidator/Touch/Peek acquire entry lock, not blocked by rc
  *
  * STRUCTURE:
- *   Owner Requester handles solver completion (no separate Resolver process).
  *   Phase 1 (atomic): search/insert under global _mtx, acquire refcount
- *   Phase 2 (non-atomic): solver execution (owner only, no locks held)
- *   Phase 3 (atomic): wait/harvest under entry mtx, release refcount
+ *   Phase 2 (atomic): resolve_hit under entry lock (existed entries only)
+ *   Phase 3 (non-atomic + atomic): solver execution + state update (owner)
+ *   Phase 4 (atomic): release refcount (EntryGuard destructor)
  *
  * MAPPING TO C++:
  * --------------------------------------------------------------------------
@@ -30,11 +39,13 @@
  * --------------------------------------------------------------------------
  * slot_rc[CAPACITY]          | CacheEntry::_refcount (atomic<int>)
  * slot_rc++ in Phase 1       | entry->acquire() in contains_or_insert_locked
- * slot_rc-- in Phase 3       | ~EntryGuard() → entry->release()
+ * slot_rc-- in Phase 4       | ~EntryGuard() → entry->release()
  * slot_rc <= 1 in eviction   | find_evictable_lru() skipping held entries
- * slot_rc <= 1 in Background | entry->mtx() acquisition (blocked by holders)
- * Phase 2 skip + atomic      | solver() then lock(entry->mtx()) + set state
- * Phase 3 Computing wait     | entry->cv().wait(lock, []{state!=Computing})
+ * !slot_locked in Bg/Inv/... | entry->mtx() availability (independent of rc)
+ * Phase 2 validity check     | resolve_hit() under entry lock
+ * Phase 2 expired→Computing  | resolve_hit nullopt → resolve_miss set Computing
+ * Phase 2 Computing wait     | entry->cv().wait(lock, []{state!=Computing})
+ * Phase 3 solver + update    | solver() then lock(entry->mtx()) + set state
  * --------------------------------------------------------------------------
  */
 
@@ -63,7 +74,7 @@ byte  slot_key[CAPACITY];
 bool  slot_expired[CAPACITY];
 byte  slot_rank[CAPACITY];
 byte  slot_rc[CAPACITY];      /* refcount */
-bool  slot_locked[CAPACITY];  /* explicit mutex state */
+bool  slot_locked[CAPACITY];  /* per-entry mutex state */
 byte  slot_age[CAPACITY];     /* TTL age: expires when >= AGE_THRESHOLD */
 byte  computing_count = 0;
 
@@ -112,7 +123,7 @@ inline move_to_lru(s)
 
 inline install_computing(s, k)
 {
-  /* Triple-delete safety: verify no external holder before overwriting */
+  /* Safety: verify no external holder before overwriting */
   if
   :: OCCUPIED(s) -> assert(slot_rc[s] == 1)  /* Eviction: only table holds ref */
   :: else        -> assert(slot_rc[s] == 0)  /* Empty slot: no refs */
@@ -201,25 +212,36 @@ inline refresh_and_check()
 }
 
 /*
- * Requester: models a thread calling get_or_compute().
- * Three-phase structure with explicit refcount acquire/release.
- */
-/*
  * get_or_compute_api: models a single call to get_or_compute().
- * Sets request_done[myid] = true on completion (including Saturation).
+ *
+ * Phase 1 (atomic, global _mtx): Search or insert.
+ *   Found: acquire refcount, move to MRU, existed=true.  NO state change.
+ *   Not found: find slot (empty/evict), install Computing, is_owner=true.
+ *
+ * Phase 2 (atomic, entry lock): Resolve hit — existed entries only.
+ *   Computing → CV wait, harvest.
+ *   Ready/Failed valid → hit.
+ *   Expired/Invalidated → transition to Computing, become owner.
+ *   Models resolve_hit() + recomputation arm of resolve_miss().
+ *
+ * Phase 3 (non-atomic + atomic): Solver + state update (owner only).
+ *   3a: entry lock — set state, decrement computing_count, set result.
+ *   3b: global lock — move_to_mru (guard against concurrent invalidation).
+ *
+ * Phase 4 (atomic): Release refcount (EntryGuard destructor).
  */
-inline get_or_compute_api(myid, mykey, sid, is_owner)
+inline get_or_compute_api(myid, mykey, sid, is_owner, existed)
 {
   sid = NONE;
   is_owner = false;
+  existed = false;
 
   /*
-   * PHASE 1: SEARCH / INSERT
-   * Models contains_or_insert_locked() under global _mtx.
-   * Acquires refcount on found/created entry.
+   * PHASE 1: SEARCH / INSERT (under global _mtx)
+   * Models contains_or_insert_locked().
+   * For found entries: acquires refcount regardless of state.
    */
   atomic {
-    /* Search hash table for key */
     if
     :: slot_key[0] == mykey && OCCUPIED(0) -> sid = 0
     :: slot_key[1] == mykey && OCCUPIED(1) -> sid = 1
@@ -228,27 +250,13 @@ inline get_or_compute_api(myid, mykey, sid, is_owner)
 
     if
     :: sid != NONE ->
-       /* Key found in slot sid */
-       if
-       :: slot_state[sid] == Computing ||
-          (MATERIALIZED(sid) && !slot_expired[sid]) ->
-          /* Valid or being computed: acquire ref, proceed to Phase 3 */
-          slot_rc[sid]++;
-          move_to_mru(sid)
-       :: slot_state[sid] == Invalidated ||
-          (MATERIALIZED(sid) && slot_expired[sid]) ->
-          /* Stale entry: reinstall as Computing (same slot, same key) */
-          slot_rc[sid]++;
-          slot_state[sid] = Computing;
-          slot_expired[sid] = false;
-          slot_age[sid] = 0;
-          computing_count++;
-          move_to_mru(sid);
-          is_owner = true
-       fi
+       /* Key found: acquire ref, move to MRU.  No state change. */
+       slot_rc[sid]++;
+       move_to_mru(sid);
+       existed = true
 
     :: else ->
-       /* Key not found. Find empty or evictable slot. */
+       /* Key not found.  Find empty or evictable slot. */
        if
        :: !OCCUPIED(0) -> sid = 0
        :: OCCUPIED(0) && !OCCUPIED(1) -> sid = 1
@@ -273,104 +281,158 @@ inline get_or_compute_api(myid, mykey, sid, is_owner)
        fi
     fi;
     refresh_and_check()
-  } /* end Phase 1 atomic */
+  } /* end Phase 1 */
 
   if
-  :: request_done[myid] -> skip   /* Saturated — terminal for this call */
-  :: sid == NONE -> skip         /* Internal retry (Phase 1 skipped due to race) */
+  :: request_done[myid] -> skip   /* Saturated */
   :: else ->
 
      /*
-      * PHASE 2: SOLVER EXECUTION (owner only)
+      * PHASE 2: RESOLVE HIT (under entry lock, existed entries only)
+      *
+      * Between Phase 1 (global lock released) and Phase 2 (entry lock
+      * acquired), Background can expire and Invalidator can invalidate.
+      * This is the key improvement over v4 which blocked them via rc<=1.
       */
      if
-     :: is_owner ->
-        skip;   /* solver work — non-atomic interleaving point */
+     :: existed && !is_owner ->
         atomic {
-          /* Completion under entry lock */
+          !slot_locked[sid] ->
+          slot_locked[sid] = true;
+
+          if
+          /*
+           * Case 1: Computing — another thread is solving.
+           * CV wait: release lock, block until state != Computing.
+           */
+          :: slot_key[sid] == mykey && slot_state[sid] == Computing ->
+             slot_locked[sid] = false;
+             slot_state[sid] != Computing && !slot_locked[sid] ->
+             slot_locked[sid] = true;
+             if
+             :: slot_key[sid] == mykey && slot_state[sid] == Ready ->
+                request_result[myid] = HitPositive;
+                request_done[myid] = true;
+                ever_stored[mykey] = true;
+                slot_age[sid] = 0
+             :: slot_key[sid] == mykey && slot_state[sid] == Failed ->
+                request_result[myid] = HitNegative;
+                request_done[myid] = true;
+                ever_stored[mykey] = true;
+                slot_age[sid] = 0
+             :: else -> skip  /* Entry modified; retry via outer loop */
+             fi
+
+          /*
+           * Case 2: Ready, not expired — positive hit.
+           */
+          :: slot_key[sid] == mykey &&
+             slot_state[sid] == Ready && !slot_expired[sid] ->
+             request_result[myid] = HitPositive;
+             request_done[myid] = true;
+             ever_stored[mykey] = true;
+             slot_age[sid] = 0
+
+          /*
+           * Case 3: Failed, not expired — negative hit.
+           */
+          :: slot_key[sid] == mykey &&
+             slot_state[sid] == Failed && !slot_expired[sid] ->
+             request_result[myid] = HitNegative;
+             request_done[myid] = true;
+             ever_stored[mykey] = true;
+             slot_age[sid] = 0
+
+          /*
+           * Case 4: Expired or Invalidated — recompute.
+           * Models resolve_hit() nullopt → resolve_miss() set Computing.
+           * Skips the intermediate Empty state (entry-lock serialized).
+           */
+          :: slot_key[sid] == mykey &&
+             (slot_state[sid] == Invalidated ||
+              (MATERIALIZED(sid) && slot_expired[sid])) ->
+             slot_state[sid] = Computing;
+             slot_expired[sid] = false;
+             slot_age[sid] = 0;
+             computing_count++;
+             is_owner = true
+
+          /* Case 5: defensive fallthrough */
+          :: else -> skip
+          fi;
+
+          slot_locked[sid] = false;
+          refresh_and_check()
+        } /* end Phase 2 */
+     :: else -> skip
+     fi;
+
+     /*
+      * PHASE 3: SOLVER EXECUTION (owner only)
+      *
+      * The skip is the solver interleaving point — no locks held.
+      * 3a: re-acquire entry lock, set terminal state, notify waiters.
+      * 3b: acquire global lock, move_to_mru, set result + done.
+      */
+     if
+     :: is_owner && !request_done[myid] ->
+        skip;   /* solver — non-atomic interleaving point */
+
+        /* 3a: state update under entry lock */
+        atomic {
+          !slot_locked[sid] ->
           slot_locked[sid] = true;
           if :: slot_state[sid] = Ready :: slot_state[sid] = Failed fi;
           slot_expired[sid] = false;
           computing_count--;
-          move_to_mru(sid);
           ever_stored[mykey] = true;
+          /* Set result while holding entry lock (before concurrent invalidation) */
+          if
+          :: slot_state[sid] == Ready  -> request_result[myid] = ComputedPositive
+          :: slot_state[sid] == Failed -> request_result[myid] = ComputedNegative
+          fi;
           refresh_and_check();
           slot_locked[sid] = false
+        };
+
+        /* 3b: move_to_mru under global lock */
+        atomic {
+          if
+          :: slot_state[sid] == Ready || slot_state[sid] == Failed ->
+             move_to_mru(sid)
+          :: else -> skip  /* Guard against concurrent invalidation */
+          fi;
+          request_done[myid] = true;
+          refresh_and_check()
         }
      :: else -> skip
      fi;
 
      /*
-      * PHASE 3: HARVEST / WAIT
+      * PHASE 4: RELEASE REFCOUNT (EntryGuard destructor)
       */
      atomic {
-       slot_locked[sid] = true;
-       if
-       :: slot_key[sid] == mykey && slot_state[sid] == Computing ->
-          slot_locked[sid] = false;
-          slot_state[sid] != Computing && !slot_locked[sid] ->
-          slot_locked[sid] = true;
-          if
-          :: slot_state[sid] == Ready ->
-             request_result[myid] = HitPositive;
-             request_done[myid] = true;
-             ever_stored[mykey] = true;
-             slot_age[sid] = 0;
-             move_to_mru(sid)
-          :: slot_state[sid] == Failed ->
-             request_result[myid] = HitNegative;
-             request_done[myid] = true;
-             ever_stored[mykey] = true;
-             slot_age[sid] = 0;
-             move_to_mru(sid)
-          fi
-
-       :: slot_key[sid] == mykey &&
-          slot_state[sid] == Ready && !slot_expired[sid] ->
-          if
-          :: is_owner -> request_result[myid] = ComputedPositive
-          :: else     -> request_result[myid] = HitPositive
-          fi;
-          request_done[myid] = true;
-          ever_stored[mykey] = true;
-          slot_age[sid] = 0;
-          move_to_mru(sid)
-
-       :: slot_key[sid] == mykey &&
-          slot_state[sid] == Failed && !slot_expired[sid] ->
-          if
-          :: is_owner -> request_result[myid] = ComputedNegative
-          :: else     -> request_result[myid] = HitNegative
-          fi;
-          request_done[myid] = true;
-          ever_stored[mykey] = true;
-          slot_age[sid] = 0;
-          move_to_mru(sid)
-
-       :: else ->
-          /* Entry was unexpectedly modified. Bail out, retry. */
-          skip
-       fi;
-
-       /* Release reference (EntryGuard destructor) */
        assert(slot_rc[sid] > 0);
        slot_rc[sid]--;
        is_owner = false;
-       refresh_and_check();
-       slot_locked[sid] = false
-     } /* end Phase 3 atomic */
+       refresh_and_check()
+     }
   fi
 }
 
+/*
+ * Requester: models a thread calling get_or_compute().
+ */
 proctype Requester(byte myid)
 {
   byte mykey = target_key[myid];
   byte sid;
   bool is_owner;
+  bool existed;
 
   do
   :: !request_done[myid] ->
-     get_or_compute_api(myid, mykey, sid, is_owner);
+     get_or_compute_api(myid, mykey, sid, is_owner, existed);
      if
      :: request_result[myid] == Saturated ->
         request_done[myid] = false;
@@ -383,125 +445,126 @@ proctype Requester(byte myid)
 
 /*
  * FindRequester: models a thread calling find().
- * Unlike Requester (get_or_compute), this process:
- *   - Never installs a Computing entry (no solver)
- *   - Returns nullopt if key not found, Invalidated, or Expired
- *   - Blocks on Computing entries (CV wait), then harvests result
- *   - Always releases refcount via EntryGuard
  *
- * MAPPING TO C++:
- *   Phase 1 → global _mtx: search_entry + acquire()
- *   Phase 2 → entry lock: is_valid_hit + cv.wait + harvest
- *   nullopt → EntryGuard dtor releases refcount
+ * Unlike get_or_compute:
+ *   - Never installs a Computing entry (no solver)
+ *   - Returns nullopt for missing, Invalidated, expired
+ *   - Blocks on Computing (CV wait), then harvests
+ *   - Does NOT move to MRU in Phase 1 (only after valid harvest)
+ *   - Acquires refcount for ANY found entry (matches C++)
  */
 proctype FindRequester(byte myid)
 {
   byte mykey = target_key[myid];
-  byte sid;
+  byte sid = NONE;
 
-  do
-  :: request_done[myid] -> break
+  /*
+   * PHASE 1: SEARCH (under global _mtx)
+   * No move_to_mru here — find() confirms validity first.
+   */
+  atomic {
+    if
+    :: slot_key[0] == mykey && OCCUPIED(0) -> sid = 0; slot_rc[0]++
+    :: slot_key[1] == mykey && OCCUPIED(1) -> sid = 1; slot_rc[1]++
+    :: else -> skip
+    fi;
+    refresh_and_check()
+  }
 
-  :: atomic {
-       !request_done[myid] ->
-       sid = NONE;
+  if
+  :: sid == NONE ->
+     request_done[myid] = true
 
-       /*
-        * PHASE 1: SEARCH + VALIDITY CHECK (under global _mtx)
-        * Acquire refcount only on valid entries (Computing, or
-        * Ready/Failed + not expired). Invalidated and expired entries
-        * produce nullopt without acquiring refcount, preserving the
-        * invariant: Invalidated → rc <= 1.
-        */
+  :: else ->
+     /*
+      * PHASE 2: VALIDITY CHECK + HARVEST (under entry lock)
+      */
+     atomic {
+       !slot_locked[sid] ->
+       slot_locked[sid] = true;
+
        if
-       :: slot_key[0] == mykey && OCCUPIED(0) &&
-          (slot_state[0] == Computing ||
-           (MATERIALIZED(0) && !slot_expired[0])) ->
-          sid = 0; slot_rc[0]++
-       :: slot_key[1] == mykey && OCCUPIED(1) &&
-          (slot_state[1] == Computing ||
-           (MATERIALIZED(1) && !slot_expired[1])) ->
-          sid = 1; slot_rc[1]++
-       :: else -> skip  /* Not found or not valid → nullopt */
+       /* Invalid: Invalidated, Empty, or expired → nullopt */
+       :: slot_key[sid] == mykey &&
+          (slot_state[sid] == Invalidated ||
+           slot_state[sid] == Empty ||
+           (MATERIALIZED(sid) && slot_expired[sid])) ->
+          skip  /* nullopt */
+
+       /* Computing: CV wait */
+       :: slot_key[sid] == mykey && slot_state[sid] == Computing ->
+          slot_locked[sid] = false;
+          slot_state[sid] != Computing && !slot_locked[sid] ->
+          slot_locked[sid] = true;
+          if
+          :: slot_key[sid] == mykey && slot_state[sid] == Ready ->
+             request_result[myid] = HitPositive;
+             slot_age[sid] = 0
+          :: slot_key[sid] == mykey && slot_state[sid] == Failed ->
+             request_result[myid] = HitNegative;
+             slot_age[sid] = 0
+          :: else -> skip  /* Modified during wait: nullopt */
+          fi
+
+       /* Ready, not expired */
+       :: slot_key[sid] == mykey &&
+          slot_state[sid] == Ready && !slot_expired[sid] ->
+          request_result[myid] = HitPositive;
+          slot_age[sid] = 0
+
+       /* Failed, not expired */
+       :: slot_key[sid] == mykey &&
+          slot_state[sid] == Failed && !slot_expired[sid] ->
+          request_result[myid] = HitNegative;
+          slot_age[sid] = 0
+
+       :: else -> skip  /* Defensive: nullopt */
        fi;
 
+       slot_locked[sid] = false;
+       refresh_and_check()
+     }
+
+     /*
+      * PHASE 2b: move_to_mru under global lock (hits only).
+      * Models: scoped_lock glock(_mtx); lru_move_to_mru(entry)
+      */
+     atomic {
        if
-       :: sid == NONE ->
-          /* find() returned nullopt: key absent, invalidated, or expired */
-          request_done[myid] = true
+       :: request_result[myid] == HitPositive ||
+          request_result[myid] == HitNegative ->
+          if
+          :: slot_state[sid] == Ready || slot_state[sid] == Failed ->
+             move_to_mru(sid)
+          :: else -> skip  /* Guard against concurrent invalidation */
+          fi
        :: else -> skip
        fi;
        refresh_and_check()
      }
 
-     if
-     :: sid == NONE -> skip  /* Already done */
-     :: else ->
-        /*
-         * PHASE 2: WAIT / HARVEST (under entry lock)
-         * Refcount (rc >= 2) protects slot from eviction and Background.
-         * If Computing: CV wait until owner completes.
-         * If Ready/Failed: harvest result immediately.
-         */
-        atomic {
-          slot_locked[sid] = true;
-          if
-          :: slot_key[sid] == mykey && slot_state[sid] == Computing ->
-             slot_locked[sid] = false;
-             slot_state[sid] != Computing && !slot_locked[sid] ->
-             slot_locked[sid] = true;
-             if
-             :: slot_key[sid] == mykey && slot_state[sid] == Ready ->
-                request_result[myid] = HitPositive;
-                slot_age[sid] = 0;
-                move_to_mru(sid)
-             :: slot_key[sid] == mykey && slot_state[sid] == Failed ->
-                request_result[myid] = HitNegative;
-                slot_age[sid] = 0;
-                move_to_mru(sid)
-             :: else -> skip
-             fi
-          :: slot_key[sid] == mykey &&
-             slot_state[sid] == Ready && !slot_expired[sid] ->
-             request_result[myid] = HitPositive;
-             slot_age[sid] = 0;
-             move_to_mru(sid)
-          :: slot_key[sid] == mykey &&
-             slot_state[sid] == Failed && !slot_expired[sid] ->
-             request_result[myid] = HitNegative;
-             slot_age[sid] = 0;
-             move_to_mru(sid)
-          :: else -> skip
-          fi;
+     /* PHASE 3: RELEASE REFCOUNT */
+     atomic {
+       assert(slot_rc[sid] > 0);
+       slot_rc[sid]--;
+       refresh_and_check()
+     };
 
-          /* Release reference (EntryGuard destructor) */
-          request_done[myid] = true;
-          assert(slot_rc[sid] > 0);
-          slot_rc[sid]--;
-          refresh_and_check();
-          slot_locked[sid] = false
-        } /* end Phase 2 atomic */
-     fi
-  od
+     request_done[myid] = true
+  fi
 }
 
 /*
- * Background: simulates TTL expiry and manual invalidation.
+ * Background: simulates TTL aging and expiry.
  *
- * NOTE: TTL aging/expiry in the model is proactive (discrete steps), 
- * whereas the C++ implementation uses lazy expiry checked on access.
- *
- * All guards require rc <= 1: this models mutex acquisition blocking 
- * (entry->mtx()) rather than the C++ refcount semantics itself. It is a 
- * conservative abstraction: if rc > 1, some thread might be holding 
- * the entry mutex or about to take it.
+ * v5 change: guard no longer requires rc <= 1.  Only !slot_locked is
+ * needed — this models entry->mtx() availability, independent of the
+ * refcount.  Allows expiry while threads hold refs (as in real C++
+ * where time passes independently of refcount).
  */
 proctype Background()
 {
   end: do
-  /* TTL Aging + Expiry: increment age, expire only at threshold.
-   * Models steady_clock advancing: entry must age AGE_THRESHOLD ticks
-   * without a hit before expiring. Hits reset age to 0. */
   :: atomic {
        MATERIALIZED(0) && !slot_expired[0] && !slot_locked[0] ->
        slot_locked[0] = true;
@@ -529,20 +592,18 @@ proctype Background()
 
 /*
  * Invalidator: models explicit invalidate(key) API calls.
- * Separated from Background (TTL expiry) to independently verify:
- *   - Computing entries are NEVER invalidated (critical safety)
- *   - Invalidation moves entry to LRU tail
  *
- * NOTE: The guard slot_rc <= 1 models the ability to acquire entry->mtx().
- * This is an intentional over-approximation (rc > 1 might report busy 
- * even if the mutex is technically free for a brief window during 
- * EntryGuard construction), ensuring safety against state transitions.
+ * v5 change: guard no longer requires rc <= 1.  In C++, invalidate()
+ * acquires entry->mtx() which is independent of refcount.  A thread
+ * can hold a ref (rc > 1) without holding the entry lock, so the
+ * Invalidator can proceed.  The thread will detect Invalidated state
+ * when it later acquires the entry lock in Phase 2.
  *
  * MAPPING TO C++:
- *   Guard (rc <= 1)          → std::scoped_lock entry_lock(entry->mtx())
- *   assert(!Computing)       → if (state == Computing) return false
- *   state = Invalidated      → entry->set_state(Invalidated)
- *   move_to_lru              → _lru_list.append(link)
+ *   Guard (!slot_locked)       → std::scoped_lock entry_lock(entry->mtx())
+ *   assert(!Computing)         → if (state == Computing) return false
+ *   state = Invalidated        → entry->set_state(Invalidated)
+ *   move_to_lru                → _lru_list.append(link)
  */
 proctype Invalidator()
 {
@@ -550,10 +611,8 @@ proctype Invalidator()
   :: atomic {
        slot_state[0] != Empty && slot_state[0] != Computing &&
        slot_state[0] != Invalidated && !slot_locked[0] ->
-       /* EntryGuard(entry) and entry_lock(entry->mtx()) */
        slot_rc[0]++;
        slot_locked[0] = true;
-       /* CRITICAL: Computing entries must never be invalidated */
        assert(slot_state[0] != Computing);
        slot_state[0] = Invalidated;
        slot_expired[0] = true;
@@ -580,13 +639,8 @@ proctype Invalidator()
 
 /*
  * TouchRequester: models explicit touch(key) API calls.
- * Refreshes TTL and moves entry to MRU position.
  *
- * MAPPING TO C++:
- *   Guard (rc <= 1)          → std::scoped_lock entry_lock(entry->mtx())
- *   MATERIALIZED + !expired  → state == Ready || state == Failed, !has_expired
- *   slot_age = 0             → entry->set_expiration(now + ttl)
- *   move_to_mru              → lru_move_to_mru(entry)
+ * v5 change: guard no longer requires rc <= 1.
  */
 proctype TouchRequester()
 {
@@ -615,23 +669,16 @@ proctype TouchRequester()
 }
 
 /*
- * PeekRequester: models peek(key) — truly non-blocking inspection.
- * Uses try_to_lock: returns nullopt immediately if entry is contended.
- * All operations are in a single atomic block (no intermediate states),
- * which guarantees peek never blocks by construction.
+ * PeekRequester: models peek(key) — truly non-blocking.
+ * Uses try_to_lock: !slot_locked models std::try_to_lock success.
  *
- * MAPPING TO C++:
- *   Guard (!slot_locked)       → std::unique_lock(mtx, std::try_to_lock)
- *   MATERIALIZED + !expired    → is_valid_hit() check
- *   atomic acquire+release     → EntryGuard RAII within the lock scope
- *   No state modification      → peek() is read-only
+ * v5 change: guard no longer requires rc <= 1.
  */
 proctype PeekRequester()
 {
   end: do
   :: atomic {
        MATERIALIZED(0) && !slot_expired[0] && !slot_locked[0] ->
-       /* Atomic peek: acquire ref, lock, read, unlock, release */
        slot_rc[0]++;
        slot_locked[0] = true;
        assert(slot_state[0] == Ready || slot_state[0] == Failed);
@@ -651,10 +698,50 @@ proctype PeekRequester()
   od
 }
 
+/*
+ * HasRequester: models has(key) — fast validity check.
+ *
+ * MAPPING TO C++:
+ *   Global lock: search_entry + acquire()
+ *   Entry lock:  check state == Ready/Failed && !expired
+ *   Release ref: ~EntryGuard()
+ *
+ * Read-only: never modifies entry state or LRU position.
+ */
+proctype HasRequester()
+{
+  end: do
+  :: atomic {
+       OCCUPIED(0) && !slot_locked[0] ->
+       slot_rc[0]++;
+       slot_locked[0] = true;
+       /* has() returns true only for Ready/Failed + not expired */
+       if
+       :: MATERIALIZED(0) && !slot_expired[0] -> skip  /* true */
+       :: else -> skip  /* false */
+       fi;
+       slot_locked[0] = false;
+       slot_rc[0]--;
+       refresh_and_check()
+     }
+  :: atomic {
+       OCCUPIED(1) && !slot_locked[1] ->
+       slot_rc[1]++;
+       slot_locked[1] = true;
+       if
+       :: MATERIALIZED(1) && !slot_expired[1] -> skip
+       :: else -> skip
+       fi;
+       slot_locked[1] = false;
+       slot_rc[1]--;
+       refresh_and_check()
+     }
+  od
+}
+
 init
 {
   atomic {
-    /* Capacity validation: models Cache constructor rejecting zero capacity */
     assert(CAPACITY > 0);
 
     clear_slot(0);
@@ -670,9 +757,7 @@ init
     target_key[2] = 1; request_done[2] = false; request_result[2] = Saturated;
     target_key[3] = 2; request_done[3] = false; request_result[3] = Saturated;
 
-    /* FindRequester threads: find() on keys 0 and 1.
-     * Thread 4 targets key 0 (interacts with thundering herd on threads 0,1).
-     * Thread 5 targets key 1 (interacts with Requester thread 2). */
+    /* FindRequester threads: find() on keys 0 and 1. */
     target_key[4] = 0; request_done[4] = false; request_result[4] = Saturated;
     target_key[5] = 1; request_done[5] = false; request_result[5] = Saturated;
 
@@ -682,6 +767,7 @@ init
     run Invalidator();
     run TouchRequester();
     run PeekRequester();
+    run HasRequester();
     run Requester(0);
     run Requester(1);
     run Requester(2);
@@ -714,4 +800,15 @@ ltl no_starvation_thread5 { [] (!request_done[5] -> <> request_done[5]) }
 ltl all_terminate {
   <> (request_done[0] && request_done[1] && request_done[2] && request_done[3] &&
       request_done[4] && request_done[5])
+}
+
+/* NEW: Whenever a computation starts, all computations eventually complete. */
+ltl no_orphaned_computing {
+  [] (computing_count > 0 -> <> (computing_count == 0))
+}
+
+/* NEW: Saturation is transient — if the cache is fully blocked,
+ * it eventually becomes unblocked (solvers finish, refs are released). */
+ltl saturation_transient {
+  [] (ALL_BLOCKED() -> <> !ALL_BLOCKED())
 }
