@@ -1,0 +1,54 @@
+#
+# Valgrind suppression file for libstdc++ shared_ptr false positives.
+#
+# Helgrind and DRD cannot see inside the atomic instructions used by
+# std::shared_ptr (_Lock_policy::_S_atomic).  The refcount increments
+# and decrements are genuinely atomic but look like unsynchronized
+# read-modify-write to these tools.
+#
+# These suppressions silence all _Sp_counted_base operations which
+# are the sole source of false positives in the cpp-cache test suite.
+#
+
+# ── Helgrind ─────────────────────────────────────────────────────────
+
+{
+   shared_ptr_release_use_count_helgrind
+   Helgrind:Race
+   fun:_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE10_M_releaseEv
+}
+
+{
+   shared_ptr_add_ref_copy_helgrind
+   Helgrind:Race
+   fun:_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE15_M_add_ref_copyEv
+}
+
+# Wildcard fallback: any race reported inside _Sp_counted_base
+{
+   shared_ptr_counted_base_any_helgrind
+   Helgrind:Race
+   obj:*libstdc++*
+   fun:_ZNSt16_Sp_counted_base*
+}
+
+# ── DRD ──────────────────────────────────────────────────────────────
+
+{
+   shared_ptr_release_use_count_drd
+   drd:ConflictingAccess
+   fun:_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE10_M_releaseEv
+}
+
+{
+   shared_ptr_add_ref_copy_drd
+   drd:ConflictingAccess
+   fun:_ZNSt16_Sp_counted_baseILN9__gnu_cxx12_Lock_policyE2EE15_M_add_ref_copyEv
+}
+
+{
+   shared_ptr_counted_base_any_drd
+   drd:ConflictingAccess
+   obj:*libstdc++*
+   fun:_ZNSt16_Sp_counted_base*
+}
