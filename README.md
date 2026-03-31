@@ -2,6 +2,8 @@
 
 A general-purpose, high-performance concurrent cache library for C++20.
 
+**Sponsored by [SIMYL RESEARCH](https://simylresearch.com/en/)**
+
 ## Key Features
 
 - **Single-flight per key** — at most one computation per key at any time; concurrent requests for the same key wait and share the result (thundering herd prevention)
@@ -97,6 +99,15 @@ Follows the same proven model as [gateway_cache](https://github.com/lrleon/gatew
    - When solver completes, all waiters are notified and share the result
 
 Different keys never block each other beyond the brief global lock for table lookup.
+
+### Solver Contract
+
+While the miss solver is running, it must not call any API on the **same**
+`Cache` instance. Doing so can create a logical self-deadlock on an entry in
+`Computing`. This implementation treats that as a fatal programming error and
+aborts immediately instead of blocking indefinitely.
+
+Calling a different `Cache` instance from the solver remains valid.
 
 ## Safety Properties
 

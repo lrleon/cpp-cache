@@ -181,6 +181,58 @@ TEST(SolverTest, mixed_positive_negative_results)
   EXPECT_EQ(s.misses, 6u);
 }
 
+TEST(RecursiveSolverDeathTest, get_or_compute_on_same_cache_aborts)
+{
+  Cache<int, int> *cache_ptr = nullptr;
+
+  Cache<int, int> cache(5, 10s, 5s,
+    [&](const int &key) -> shared_ptr<int>
+    {
+      cache_ptr->get_or_compute(key);
+      return make_shared<int>(key * 10); // unreachable
+    });
+
+  cache_ptr = &cache;
+
+  ASSERT_DEATH({ cache.get_or_compute(1); },
+               "recursive cache API call to get_or_compute\\(\\)");
+}
+
+TEST(RecursiveSolverDeathTest, find_on_same_cache_aborts)
+{
+  Cache<int, int> *cache_ptr = nullptr;
+
+  Cache<int, int> cache(5, 10s, 5s,
+    [&](const int &key) -> shared_ptr<int>
+    {
+      cache_ptr->find(key);
+      return make_shared<int>(key * 10); // unreachable
+    });
+
+  cache_ptr = &cache;
+
+  ASSERT_DEATH({ cache.get_or_compute(1); },
+               "recursive cache API call to find\\(\\)");
+}
+
+TEST(RecursiveSolverGuardTest, different_cache_instance_is_allowed)
+{
+  Cache<int, int> cache_b(5, 10s, 5s, int_solver);
+
+  Cache<int, int> cache_a(5, 10s, 5s,
+    [&](const int &key) -> shared_ptr<int>
+    {
+      auto nested = cache_b.get_or_compute(key + 100);
+      EXPECT_TRUE(nested.is_positive());
+      return make_shared<int>(*nested.value());
+    });
+
+  auto r = cache_a.get_or_compute(1);
+
+  ASSERT_TRUE(r.is_positive());
+  EXPECT_EQ(*r.value(), 1010);
+}
+
 // ================================================================
 // Section 3: Find Operations
 // ================================================================

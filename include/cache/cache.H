@@ -22,6 +22,8 @@
 #include <chrono>
 #include <concepts>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -29,6 +31,7 @@
 
 #include <aleph.H>
 #include <dlink.H>
+#include <tpl_array.H>
 #include <tpl_lhash.H>
 
 #include <cache/cache_result.H>
@@ -82,6 +85,11 @@ public:
    *
    * Receives a key and returns a shared_ptr<Value>.
    * If the solver returns nullptr, it is considered a cacheable failure.
+   *
+   * @warning Solver contract: while the solver is running, it MUST NOT call
+   * any API on the same Cache instance. Re-entering the same cache from the
+   * solver can self-deadlock on an entry stuck in Computing. This
+   * implementation treats that as a fatal programming error and aborts.
    */
   using MissSolver = std::function<std::shared_ptr<Value>(const Key &, Args...)>;
 
@@ -89,6 +97,81 @@ public:
   using HashFct = std::function<size_t(const Key &)>;
 
 private:
+  /**
+   * @brief Per-thread stack of Cache instances currently executing their solver.
+   *
+   * This is thread-local, so it needs no mutex: each thread sees and mutates
+   * only its own stack. We use it to detect forbidden re-entry from a solver
+   * back into the same Cache instance.
+   */
+  static auto &active_solver_caches() noexcept
+  {
+    static thread_local Aleph::Array<const void *> caches;
+    return caches;
+  }
+
+  [[noreturn]] static void abort_recursive_solver_call(const char *api_name) noexcept
+  {
+    std::fprintf(stderr,
+                 "cpp-cache fatal: recursive cache API call to %s from solver on the same Cache instance is forbidden.\n",
+                 api_name);
+    std::fflush(stderr);
+    std::abort();
+  }
+
+  /**
+   * @brief Fail fast if a cache API is called from that cache's own solver.
+   *
+   * This prevents logical self-deadlocks such as:
+   *   get_or_compute(k) -> solver(k) -> get_or_compute(k)
+   * or:
+   *   get_or_compute(k) -> solver(k) -> find(k)
+   *
+   * The check scans the current thread's stack of "solver-active" caches.
+   */
+  void fail_if_called_from_solver(const char *api_name) const noexcept
+  {
+    const auto &caches = active_solver_caches();
+    for (size_t i = 0; i < caches.size(); ++i)
+      if (caches(i) == this)
+        abort_recursive_solver_call(api_name);
+  }
+
+  /**
+   * @brief RAII marker for "this thread is executing the solver of Cache X".
+   *
+   * The constructor pushes the cache identity into the thread-local stack and
+   * the destructor removes it. RAII matters here because the solver can:
+   *
+   * - return normally
+   * - throw an exception
+   * - have multiple early-exit paths added in the future
+   *
+   * By tying the push/pop to object lifetime, the stack is always restored even
+   * when the solver throws. Without this guard, a stale marker could remain in
+   * the thread-local stack and later trigger spurious aborts.
+   */
+  struct SolverExecutionGuard
+  {
+    const void *cache;
+
+    explicit SolverExecutionGuard(const void *cache_ptr) noexcept : cache(cache_ptr)
+    {
+      active_solver_caches().append(cache);
+    }
+
+    ~SolverExecutionGuard()
+    {
+      auto &caches = active_solver_caches();
+      assert(not caches.is_empty());
+      assert(caches.get_last() == cache);
+      [[maybe_unused]] const auto removed = caches.remove_last();
+    }
+
+    SolverExecutionGuard(const SolverExecutionGuard &) = delete;
+    SolverExecutionGuard &operator=(const SolverExecutionGuard &) = delete;
+  };
+
   /**
    * @brief Internal representation of a cache slot.
    *
@@ -638,6 +721,12 @@ private:
       {
         // Run user code without holding any mutexes to avoid deadlocks
         // and allow maximum concurrency.
+        //
+        // SolverExecutionGuard marks this Cache instance as "solver-active"
+        // for the current thread. If the solver re-enters the same cache,
+        // the public API will detect it and abort instead of silently
+        // self-deadlocking on a Computing entry.
+        SolverExecutionGuard solver_guard(this);
         result = _solver(entry->key(), std::forward<Args>(args)...);
         solver_succeeded = (result != nullptr);
       }
@@ -783,6 +872,8 @@ public:
    */
   CacheResult<Value> get_or_compute(const Key &key, Args... args)
   {
+    fail_if_called_from_solver("get_or_compute()");
+
     std::pair<CacheEntry *, bool> p;
     {
       // First phase: structural check with global lock
@@ -833,6 +924,7 @@ public:
    */
   std::shared_ptr<Value> get(const Key &key, Args... args)
   {
+    fail_if_called_from_solver("get()");
     return get_or_compute(key, std::forward<Args>(args)...).value();
   }
 
@@ -848,6 +940,8 @@ public:
    */
   std::optional<CacheResult<Value>> find(const Key &key)
   {
+    fail_if_called_from_solver("find()");
+
     CacheEntry *entry;
     {
       std::scoped_lock glock(_mtx);
@@ -926,6 +1020,8 @@ public:
    */
   bool invalidate(const Key &key)
   {
+    fail_if_called_from_solver("invalidate()");
+
     CacheEntry *entry;
     {
       std::scoped_lock glock(_mtx);
@@ -968,6 +1064,8 @@ public:
    */
   bool touch(const Key &key)
   {
+    fail_if_called_from_solver("touch()");
+
     CacheEntry *entry;
     {
       std::scoped_lock glock(_mtx);
@@ -1013,6 +1111,8 @@ public:
    */
   std::optional<CacheResult<Value>> peek(const Key &key)
   {
+    fail_if_called_from_solver("peek()");
+
     CacheEntry *entry;
     {
       std::scoped_lock glock(_mtx);
@@ -1049,6 +1149,8 @@ public:
    */
   bool has(const Key &key)
   {
+    fail_if_called_from_solver("has()");
+
     CacheEntry *entry;
     {
       std::scoped_lock glock(_mtx);
@@ -1081,6 +1183,7 @@ public:
    */
   size_t size() const
   {
+    fail_if_called_from_solver("size()");
     std::scoped_lock glock(_mtx);
     return _table.size();
   }
@@ -1091,6 +1194,7 @@ public:
    */
   size_t capacity() const noexcept
   {
+    fail_if_called_from_solver("capacity()");
     return _capacity;
   }
 
@@ -1100,6 +1204,7 @@ public:
    */
   CacheStats stats() const
   {
+    fail_if_called_from_solver("stats()");
     return CacheStats{_stat_hits.load(std::memory_order_relaxed),
                       _stat_misses.load(std::memory_order_relaxed),
                       _stat_negative_hits.load(std::memory_order_relaxed),
