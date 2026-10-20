@@ -294,6 +294,9 @@ APPROXIMATE_COMPRESSION = %i[bitstate hc hc0 hc1 hc2 hc3 hc4].freeze
 # verdict is read from its output.
 def parse_pan_result(output, exit_code = 0, opts = {})
   errors = output.scan(/errors:\s*(\d+)/).last&.first&.to_i
+  # With --bounded (pan -b) a depth overrun is counted as an error and reported
+  # as "depth limit reached"; it is a truncated search, not a property violation.
+  depth_limit_errors = output.scan(/^pan:\d+: depth limit reached/).size
   states = output[/^\s*(\S+)\s+states,\s*stored/, 1]
   depth  = output[/depth reached\s+(\d+)/, 1]
   mem    = output[/^\s*(\S+)\s+total actual memory usage/, 1]
@@ -301,14 +304,16 @@ def parse_pan_result(output, exit_code = 0, opts = {})
   incomplete = []
   incomplete << 'no final report from pan' if errors.nil?
   incomplete << 'memory bound reached (raise --memlim)' if output.include?('reached -DMEMLIM bound')
-  incomplete << 'depth bound reached (raise --depth)' if output.include?('max search depth too small')
+  incomplete << 'depth bound reached (raise --depth)' if output.include?('max search depth too small') || depth_limit_errors > 0
   incomplete << 'interrupted' if output.match?(/^Interrupted/)
   incomplete << 'search not completed' if incomplete.empty? && output.include?('Search not completed')
   incomplete << "pan exit status #{exit_code}" if incomplete.empty? && exit_code != 0
 
   approximate = APPROXIMATE_COMPRESSION.include?(opts[:compress]) || opts[:idfs_fast] ? true : false
 
-  { errors: errors, states: states, depth: depth, memory: mem,
+  violations = errors && [errors - depth_limit_errors, 0].max
+
+  { errors: errors, violations: violations, states: states, depth: depth, memory: mem,
     incomplete: incomplete, approximate: approximate }
 end
 
@@ -322,7 +327,7 @@ def report_result(result, label)
   reasons << 'approximate search: bitstate or hash compaction can miss states' if result[:approximate]
 
   status =
-    if result[:errors] && result[:errors] > 0
+    if result[:violations] && result[:violations] > 0
       :fail
     elsif !reasons.empty?
       :incomplete
@@ -334,9 +339,9 @@ def report_result(result, label)
   when :pass
     puts Color.green("  ✓ #{label}: PASSED (full state space explored, no errors)")
   when :fail
-    puts Color.red("  ✗ #{label}: FAILED (#{result[:errors]} error(s))")
+    puts Color.red("  ✗ #{label}: FAILED (#{result[:violations]} error(s))")
   else
-    caveat = result[:errors] == 0 ? '; "errors: 0" only covers the explored part' : ''
+    caveat = result[:violations] == 0 ? '; no violations in the explored part' : ''
     puts Color.yellow("  ? #{label}: INCOMPLETE (#{reasons.join('; ')})#{caveat}")
   end
 
