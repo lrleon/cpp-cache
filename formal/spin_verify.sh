@@ -1,97 +1,62 @@
 #!/usr/bin/env bash
-# spin_verify.sh - Wrapper script for SPIN verification of cache_model.pml
-# 
-# This script provides a simple interface for common SPIN tasks:
-# - Safety check (assertions and deadlocks)
-# - LTL verification (liveness properties)
-# - Random simulation
+# spin_verify.sh - Shortcuts for common SPIN tasks on cache_model.pml
 #
 # Usage:
-#   ./spin_verify.sh safety
-#   ./spin_verify.sh ltl <property_name>
-#   ./spin_verify.sh sim
-#   ./spin_verify.sh all
+#   ./spin_verify.sh safety            assertion search, without never claims
+#   ./spin_verify.sh ltl <property>    one LTL property under weak fairness
+#   ./spin_verify.sh all               assertions and every LTL property
+#   ./spin_verify.sh list              LTL properties declared in the model
+#   ./spin_verify.sh sim               random simulation
+#
+# safety, ltl and all delegate to ./run_spin.sh, which reports PASS, FAIL or
+# INCOMPLETE for each search, accepts the same environment variables (MEMLIM,
+# DEPTH, NFAIR, COLLAPSE, TIMEOUT, OUT_DIR) and uses the same exit status:
+# 0 all PASS, 1 any FAIL, 2 some INCOMPLETE, 3 usage or tool error.
 
 set -euo pipefail
 
-MODEL="cache_model.pml"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PAN="$DIR/pan"
+MODEL_FILE="$DIR/cache_model.pml"
 
-cd "$DIR"
-
-# Cleanup function
-cleanup() {
-    rm -f pan.* "$PAN" _spin_nvr.tmp
+list_props() {
+    sed -n 's/^[[:space:]]*ltl[[:space:]]\{1,\}\([A-Za-z_][A-Za-z0-9_]*\).*/\1/p' "$MODEL_FILE"
 }
 
-# Compile the verifier
-compile_pan() {
-    echo "--- Compiling verifier for $MODEL ---"
-    spin -a "$MODEL"
-    # -DNFAIR=8: use weak fairness (required for liveness properties)
-    # -DMEMLIM=4096: allow up to 4GB of RAM
-    # -O2: optimization for speed
-    cc -O2 -DNFAIR=8 -DMEMLIM=4096 -o "$PAN" pan.c
-}
-
-run_safety() {
-    compile_pan
-    echo "--- Running Safety Check (Assertions & Deadlocks) ---"
-    # -m100000: max search depth
-    # -n: suppress some output
-    # -E: ignore invalid end states (expected for background processes)
-    "$PAN" -m100000 -n -E
-    cleanup
-}
-
-run_ltl() {
-    local prop=$1
-    compile_pan
-    echo "--- Running LTL Verification for: $prop ---"
-    # -a: search for acceptance cycles
-    # -N: specify the never claim (LTL property) name
-    if "$PAN" -m100000 -n -E -a -N "$prop"; then
-        echo "LTL property '$prop' PASSED."
-    else
-        echo "LTL property '$prop' FAILED."
-    fi
-    cleanup
-}
-
-run_sim() {
-    echo "--- Running Random Simulation ---"
-    # -p: print all statements
-    # -g: print global variables
-    # -l: print local variables
-    spin -p -g -l "$MODEL"
+usage() {
+    echo "Usage: $0 {safety|ltl <property>|all|list|sim}"
+    echo ""
+    echo "Examples:"
+    echo "  $0 safety"
+    echo "  $0 ltl all_terminate"
+    echo "  MEMLIM=16384 $0 all"
+    echo "  $0 sim"
 }
 
 case "${1:-}" in
     safety)
-        run_safety
+        exec env SAFETY=1 PROPS=none "$DIR/run_spin.sh"
         ;;
     ltl)
         if [[ -z "${2:-}" ]]; then
-            echo "Error: Please specify an LTL property name."
-            echo "Available properties: every_requested_key_eventually_materializes, all_terminate, no_starvation_thread[0-5]"
-            exit 1
+            echo "Error: please specify an LTL property name. Declared in the model:" >&2
+            list_props | sed 's/^/  /' >&2
+            exit 3
         fi
-        run_ltl "$2"
-        ;;
-    sim)
-        run_sim
+        exec env SAFETY=0 PROPS="$2" "$DIR/run_spin.sh"
         ;;
     all)
-        ./run_spin.sh
+        exec "$DIR/run_spin.sh"
+        ;;
+    list)
+        list_props
+        ;;
+    sim)
+        cd "$DIR"
+        # -p: print all statements, -g: print global variables, -l: print local variables
+        exec spin -p -g -l "$(basename "$MODEL_FILE")"
         ;;
     *)
-        echo "Usage: $0 {safety|ltl <prop>|sim|all}"
-        echo ""
-        echo "Examples:"
-        echo "  $0 safety"
-        echo "  $0 ltl all_terminate"
-        echo "  $0 sim"
-        exit 1
+        usage
+        exit 3
         ;;
 esac
