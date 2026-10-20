@@ -58,10 +58,11 @@ system in C++ that incorporates TTL (Time To Live) management with
 sliding window refreshes, entry states, and a variadic API with perfect
 forwarding. We detail the concurrency challenges, lock-free performance
 metrics, and formal verification using advanced Promela models that 
-account for locking gaps and ABA protection. The implementation has been 
-validated in production, handling \textbf{100,000 requests per second} 
-in a Kubernetes environment, and maintains \textbf{80\% docstring coverage}
-for high maintainability.
+account for locking gaps and ABA protection. The architecture it implements
+was validated in 2023 load tests in a controlled Kubernetes environment,
+handling \textbf{100,000 requests per second}, and follows a Go cache that has
+run in production for more than five years. The implementation maintains
+\textbf{80\% docstring coverage} for high maintainability.
 \end{abstract}
 
 \section{Introduction}
@@ -469,7 +470,7 @@ captures the C++ synchronization semantics. The model includes:
 \item \textbf{Three-Phase Locking}: Phase 1 (global lock), Phase 2 (solver), 
       Phase 3 (entry lock + CV wait).
 \item \textbf{All Public API}: Separate processes model \texttt{get\_or\_compute},
-      \texttt{find}, \texttt{invalidate}, \texttt{touch}, and \texttt{peek}.
+      \texttt{find}, \texttt{invalidate}, \texttt{touch}, \texttt{peek}, and \texttt{has}.
 \end{itemize}
 
 \subsection{Concurrent Processes}
@@ -486,50 +487,74 @@ Process & Instances & Type & Models \\
 \texttt{Invalidator} & 1 & Continuous & \texttt{invalidate()} \\
 \texttt{TouchRequester} & 1 & Continuous & \texttt{touch()} \\
 \texttt{PeekRequester} & 1 & Continuous & \texttt{peek()} (try\_lock) \\
+\texttt{HasRequester} & 1 & Continuous & \texttt{has()} \\
 \bottomrule
 \end{tabular}
-\caption{10 concurrent processes in the verification model}
+\caption{11 concurrent processes in the verification model}
 \end{table}
 
 \subsection{Verified Properties}
 
-\begin{lstlisting}[language=Promela, caption=LTL properties verified under weak fairness]
-// Liveness: All 6 request threads eventually complete
-ltl all_terminate { <> (request_done[0] && ... && request_done[5]) }
+Safety is expressed as 30 \texttt{assert} statements, checked on every
+transition, and the ten LTL properties below are checked under weak fairness.
 
-// No starvation: Each thread eventually completes
+\begin{lstlisting}[language=Promela, caption=LTL properties checked under weak fairness]
+// Materialization: every requested key is eventually computed
+ltl every_requested_key_eventually_materializes {
+  <> (ever_stored[0] && ever_stored[1] && ever_stored[2]) }
+
+// No starvation: each request thread eventually completes
 ltl no_starvation_thread0 { [] (!request_done[0] -> <> request_done[0]) }
 // ... (repeated for threads 1-5)
 
-// Materialization: Every requested key is eventually computed
-ltl every_key_materializes { <> (ever_stored[0] && ever_stored[1] && ever_stored[2]) }
+// Liveness: all 6 request threads eventually complete
+ltl all_terminate { <> (request_done[0] && ... && request_done[5]) }
+
+// Every started computation eventually completes
+ltl no_orphaned_computing { [] (computing_count > 0 -> <> (computing_count == 0)) }
+
+// Saturation is transient
+ltl saturation_transient { [] (ALL_BLOCKED() -> <> !ALL_BLOCKED()) }
 \end{lstlisting}
 
 \subsection{Verification Results (SPIN 6.5.2)}
 
+The run below checked model v5 (commit \texttt{5bfaf38}) on October 19, 2026,
+on an AMD Ryzen 7 PRO 7840U. No search exhausted the state space: every LTL
+search stopped at the 4~GB memory bound (\texttt{-DMEMLIM=4096}), and the
+assertion-only search, compiled without never claims and with
+\texttt{-DCOLLAPSE}, was stopped by the operating system for lack of memory
+after 38 minutes under a 40~GB bound. None of them found errors in the part
+they explored; these are results for the explored part of a bounded model,
+not a proof. The full \texttt{pan} output is published at
+\url{https://github.com/simylresearch/simyl-benchmarks/tree/main/formal/cpp-cache-5bfaf38}.
+
 \begin{table}[htbp]
 \centering
-\begin{tabular}{@{}lrl@{}}
+\small
+\begin{tabular}{@{}lrrl@{}}
 \toprule
-Property & States & Result \\
+Search & Stored states & Depth & Result \\
 \midrule
-Safety (23+ assertions) & 3,500,000 & 0 errors \\
-\texttt{all\_terminate} & depth 547 & 0 errors \\
-\texttt{every\_key\_materializes} & depth 512 & 0 errors \\
-\texttt{no\_starvation\_thread0..5} & depth 417--547 & 0 errors \\
+Assertions (30), no claim, 40~GB & 537,000,000 & 467 & 0 errors; stopped \\
+\texttt{every\_requested\_key\_eventually\_materializes} & 11,492,902 & 642 & 0 errors; truncated \\
+\texttt{no\_starvation\_thread0..5} & 11.5--14.8 M & 594--673 & 0 errors; truncated \\
+\texttt{all\_terminate} & 11,601,511 & 683 & 0 errors; truncated \\
+\texttt{no\_orphaned\_computing} & 27,012,836 & 540 & 0 errors; truncated \\
+\texttt{saturation\_transient} & 27,018,914 & 645 & 0 errors; truncated \\
 \bottomrule
 \end{tabular}
-\caption{Exhaustive verification results}
+\caption{Bounded verification results: no search completed}
 \end{table}
 
-\subsection{Bug Found by Formal Verification}
+\subsection{Bug Found While Building the Model}
 
-The model revealed a critical bug in \texttt{find\_evictable\_lru()}:
-the C++ code did not check the refcount before eviction, allowing entries
-held by active \texttt{EntryGuard} instances to be evicted, causing
-potential use-after-free.
+Comparing the model with the C++ code revealed a critical bug in
+\texttt{find\_evictable\_lru()}: the C++ code did not check the refcount
+before eviction, allowing entries held by active \texttt{EntryGuard}
+instances to be evicted, causing potential use-after-free.
 
-\begin{lstlisting}[caption=Bug fix identified by formal model]
+\begin{lstlisting}[caption=Bug fix identified while building the formal model]
 // BEFORE (bug): eviction possible with active holders
 if (entry->state() != EntryState::Computing)
   return entry;
@@ -540,9 +565,10 @@ if (entry->state() != EntryState::Computing &&
   return entry;
 \end{lstlisting}
 
-This demonstrates the value of formal verification: the model's
-\texttt{slot\_rc[s] <= 1} guard in eviction was already correct,
-exposing the missing check in the C++ implementation.
+This shows the value of writing the model: its \texttt{slot\_rc[s] <= 1}
+guard in eviction was already correct, and checking the model against the
+code exposed the missing check in the C++ implementation. SPIN did not
+produce a counterexample for this bug; it surfaced in the model-to-code review.
 
 \section{Distributed Architecture in Kubernetes}
 
@@ -595,7 +621,7 @@ requests based on fixture ID.
 \item \textbf{Fault Tolerance}: Automatic failover in Kubernetes
 \end{enumerate}
 
-\subsection{Production Performance Results}
+\subsection{Performance Results}
 
 \begin{table}[htbp]
 \centering
@@ -603,14 +629,14 @@ requests based on fixture ID.
 \toprule
 Metric & Value & Observations \\
 \midrule
-Maximum throughput & 100,000 req/sec & Production \\
+Maximum throughput & 100,000 req/sec & 2023 load test \\
 p95 latency & < 5ms & Cache hit \\
 Average hit ratio & > 95\% & Fixture data \\
 CPU utilization & 60-70\% & Per pod \\
 Memory utilization & 2-4GB & Per pod \\
 \bottomrule
 \end{tabular}
-\caption{Production performance metrics}
+\caption{Performance metrics; maximum throughput from 2023 load tests in a controlled environment}
 \end{table}
 
 \section{Circuit Breakers}
@@ -775,8 +801,8 @@ The presented implementation successfully solves the main challenges of
 a thread-safe cache system:
 
 \begin{itemize}
-\item \textbf{Correctness}: Formally verified using Promela
-\item \textbf{Performance}: 100,000 req/sec in production
+\item \textbf{Correctness}: Bounded Promela model checked with SPIN; no errors in the explored state space
+\item \textbf{Performance}: 100,000 req/sec in 2023 load tests
 \item \textbf{Scalability}: Hash routing enables horizontal scaling
 \item \textbf{Functionality}: TTL, states, integrated metrics
 \item \textbf{Operational}: Fault tolerance and observability
@@ -820,14 +846,15 @@ fixture data.
 
 \subsection{Model Overview (v5)}
 
-The Promela model (\texttt{formal/cache\_model.pml}) provides exhaustive
-verification of the cache's concurrency semantics. Key characteristics:
+The Promela model (\texttt{formal/cache\_model.pml}) captures the cache's
+concurrency semantics within fixed bounds. Key characteristics:
 
 \begin{itemize}
-\item \textbf{Capacity}: 2 slots, 3 keys, 6 request threads + 4 background processes
-\item \textbf{State vector}: 152 bytes
-\item \textbf{State space}: $\sim$3.5 million states explored exhaustively
-\item \textbf{Verification time}: $\sim$4 seconds on modern hardware
+\item \textbf{Capacity}: 2 slots, 3 keys, 6 request threads + 5 background processes
+\item \textbf{Checks}: 30 assertions and 10 LTL properties
+\item \textbf{State vector}: 168 bytes in the LTL searches
+\item \textbf{State space}: not exhausted; with a 4~GB bound the LTL searches stop
+      after 11.5 to 27 million stored states, about an hour for the ten of them
 \end{itemize}
 
 \subsection{What is Modeled}
@@ -838,7 +865,7 @@ verification of the cache's concurrency semantics. Key characteristics:
 \item \textbf{TTL aging}: \texttt{slot\_age[]} with \texttt{AGE\_THRESHOLD} 
       models sliding-window TTL refresh
 \item \textbf{All public API}: \texttt{get\_or\_compute}, \texttt{find}, 
-      \texttt{invalidate}, \texttt{touch}, \texttt{peek}
+      \texttt{invalidate}, \texttt{touch}, \texttt{peek}, \texttt{has}
 \item \textbf{LRU eviction}: With refcount guard (\texttt{rc <= 1})
 \item \textbf{Three-phase locking}: Global lock $\to$ solver $\to$ entry lock
 \item \textbf{CV wait semantics}: Non-owners block on Computing entries
@@ -855,12 +882,12 @@ verification of the cache's concurrency semantics. Key characteristics:
 
 \subsection{Verification Value}
 
-The model proved its worth by discovering a real bug: the C++ 
-\texttt{find\_evictable\_lru()} was missing the refcount check that the
-model already enforced. This demonstrates that formal verification
-catches bugs that escape code review and testing.
+Writing the model proved its worth: checking it against the code exposed a
+real bug, since the C++ \texttt{find\_evictable\_lru()} was missing the
+refcount check that the model already enforced. The bug was found in that
+review, not as a SPIN counterexample.
 
-Production testing at 100K req/sec complements formal verification by
-validating performance under realistic loads.
+Load testing at 100K req/sec (2023, controlled environment) complements the
+model by validating performance under realistic loads.
 
 \end{document}
