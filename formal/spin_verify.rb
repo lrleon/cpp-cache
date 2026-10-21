@@ -185,7 +185,9 @@ def build_cflags(opts, mode)
   flags << '-DREACH' if opts[:reach]
 
   # === No claims ===
-  flags << '-DNOCLAIM' if opts[:no_claim]
+  # The safety command checks the assertions on their own; without -DNOCLAIM pan
+  # would run them inside the first LTL claim of the model.
+  flags << '-DNOCLAIM' if opts[:no_claim] || mode == :safety
 
   # === Randomization ===
   flags << '-DP_RAND'  if opts[:p_rand]
@@ -286,23 +288,61 @@ end
 # ---------------------------------------------------------------------------
 # Result parsing
 # ---------------------------------------------------------------------------
-def parse_pan_result(output)
-  errors = output[/errors:\s*(\d+)/, 1]&.to_i
-  states = output[/states,\s*stored\s*$|(\S+)\s+states,\s*stored/m, 1]
-  depth  = output[/depth reached\s+(\d+)/, 1]
-  mem    = output[/total actual memory usage\s*$|(\S+)\s+total actual memory/m, 1]
+APPROXIMATE_COMPRESSION = %i[bitstate hc hc0 hc1 hc2 hc3 hc4].freeze
 
-  { errors: errors, states: states, depth: depth, memory: mem }
+# pan exits with status 0 even when it finds errors or stops early, so the
+# verdict is read from its output.
+def parse_pan_result(output, exit_code = 0, opts = {})
+  errors = output.scan(/errors:\s*(\d+)/).last&.first&.to_i
+  # With --bounded (pan -b) a depth overrun is counted as an error and reported
+  # as "depth limit reached"; it is a truncated search, not a property violation.
+  depth_limit_errors = output.scan(/^pan:\d+: depth limit reached/).size
+  states = output[/^\s*(\S+)\s+states,\s*stored/, 1]
+  depth  = output[/depth reached\s+(\d+)/, 1]
+  mem    = output[/^\s*(\S+)\s+total actual memory usage/, 1]
+
+  incomplete = []
+  incomplete << 'no final report from pan' if errors.nil?
+  incomplete << 'memory bound reached (raise --memlim)' if output.include?('reached -DMEMLIM bound')
+  incomplete << 'depth bound reached (raise --depth)' if output.include?('max search depth too small') || depth_limit_errors > 0
+  incomplete << 'interrupted' if output.match?(/^Interrupted/)
+  incomplete << 'search not completed' if incomplete.empty? && output.include?('Search not completed')
+  incomplete << "pan exit status #{exit_code}" if incomplete.empty? && exit_code != 0
+
+  approximate = APPROXIMATE_COMPRESSION.include?(opts[:compress]) || opts[:idfs_fast] ? true : false
+
+  violations = errors && [errors - depth_limit_errors, 0].max
+
+  { errors: errors, violations: violations, states: states, depth: depth, memory: mem,
+    incomplete: incomplete, approximate: approximate }
 end
 
+# Prints the verdict of one search and returns :pass, :fail or :incomplete.
+#   PASS        full state space explored, no errors
+#   FAIL        pan reported errors
+#   INCOMPLETE  stopped early or approximate; "errors: 0" only covers what was explored
 def report_result(result, label)
   puts ''
-  if result[:errors] && result[:errors] == 0
-    puts Color.green("  ✓ #{label}: PASSED")
-  elsif result[:errors] && result[:errors] > 0
-    puts Color.red("  ✗ #{label}: FAILED (#{result[:errors]} error(s))")
+  reasons = result[:incomplete].dup
+  reasons << 'approximate search: bitstate or hash compaction can miss states' if result[:approximate]
+
+  status =
+    if result[:violations] && result[:violations] > 0
+      :fail
+    elsif !reasons.empty?
+      :incomplete
+    else
+      :pass
+    end
+
+  case status
+  when :pass
+    puts Color.green("  ✓ #{label}: PASSED (full state space explored, no errors)")
+  when :fail
+    puts Color.red("  ✗ #{label}: FAILED (#{result[:violations]} error(s))")
   else
-    puts Color.yellow("  ? #{label}: result unclear — check output above")
+    caveat = result[:violations] == 0 ? '; no violations in the explored part' : ''
+    puts Color.yellow("  ? #{label}: INCOMPLETE (#{reasons.join('; ')})#{caveat}")
   end
 
   parts = []
@@ -310,6 +350,20 @@ def report_result(result, label)
   parts << "depth=#{result[:depth]}" if result[:depth]
   parts << "memory=#{result[:memory]}" if result[:memory]
   puts "  #{Color.dim(parts.join(', '))}" unless parts.empty?
+  status
+end
+
+def overall_status(counts)
+  return :fail if counts[:fail] > 0
+  return :incomplete if counts[:incomplete] > 0
+
+  :pass
+end
+
+def summary_line(counts)
+  failed = counts[:fail] > 0 ? Color.red("#{counts[:fail]} failed") : "#{counts[:fail]} failed"
+  incomplete = counts[:incomplete] > 0 ? Color.yellow("#{counts[:incomplete]} incomplete") : "#{counts[:incomplete]} incomplete"
+  "  #{Color.green("#{counts[:pass]} passed")}, #{failed}, #{incomplete} (#{counts.values.sum} total)"
 end
 
 # ---------------------------------------------------------------------------
@@ -320,10 +374,9 @@ def cmd_safety(model, pan_bin, opts)
   pan_args = build_pan_args(opts, mode: :safety)
   banner('Safety check — assertions & deadlocks')
   cmd_line("#{pan_bin} #{pan_args}")
-  out, _code = run_streaming("#{pan_bin} #{pan_args}")
-  result = parse_pan_result(out)
+  out, code = run_streaming("#{pan_bin} #{pan_args}")
+  result = parse_pan_result(out, code, opts)
   report_result(result, 'Safety')
-  result[:errors] == 0
 end
 
 def cmd_ltl(model, pan_bin, opts, prop, ltl_props)
@@ -341,24 +394,21 @@ def cmd_ltl(model, pan_bin, opts, prop, ltl_props)
   puts "  #{Color.dim(desc)}" if desc
   puts ''
   cmd_line("#{pan_bin} #{pan_args}")
-  out, _code = run_streaming("#{pan_bin} #{pan_args}")
-  result = parse_pan_result(out)
+  out, code = run_streaming("#{pan_bin} #{pan_args}")
+  result = parse_pan_result(out, code, opts)
   report_result(result, "LTL '#{prop}'")
-  result[:errors] == 0
 end
 
 def cmd_liveness(model, pan_bin, opts, props, ltl_props)
-  passed = 0
-  failed = 0
+  counts = { pass: 0, fail: 0, incomplete: 0 }
   props.each do |prop|
-    ok = cmd_ltl(model, pan_bin, opts, prop, ltl_props)
-    ok ? passed += 1 : failed += 1
+    counts[cmd_ltl(model, pan_bin, opts, prop, ltl_props)] += 1
     cleanup(SCRIPT_DIR, pan_bin)
   end
   puts ''
   banner('Liveness summary')
-  puts "  #{Color.green("#{passed} passed")}, #{failed > 0 ? Color.red("#{failed} failed") : "#{failed} failed"}"
-  failed == 0
+  puts summary_line(counts)
+  overall_status(counts)
 end
 
 def cmd_non_progress(model, pan_bin, opts)
@@ -366,10 +416,9 @@ def cmd_non_progress(model, pan_bin, opts)
   pan_args = build_pan_args(opts, mode: :non_progress)
   banner('Non-progress cycle detection')
   cmd_line("#{pan_bin} #{pan_args}")
-  out, _code = run_streaming("#{pan_bin} #{pan_args}")
-  result = parse_pan_result(out)
+  out, code = run_streaming("#{pan_bin} #{pan_args}")
+  result = parse_pan_result(out, code, opts)
   report_result(result, 'Non-progress')
-  result[:errors] == 0
 end
 
 def cmd_sim(model, opts)
@@ -422,27 +471,22 @@ end
 
 def cmd_all(model, pan_bin, opts, ltl_props)
   banner('FULL VERIFICATION SUITE')
-  total_pass = 0
-  total_fail = 0
+  counts = { pass: 0, fail: 0, incomplete: 0 }
 
   # Safety
-  ok = cmd_safety(model, pan_bin, opts)
-  ok ? total_pass += 1 : total_fail += 1
+  counts[cmd_safety(model, pan_bin, opts)] += 1
   cleanup(SCRIPT_DIR, pan_bin)
 
   # All LTL properties
   ltl_props.each_key do |prop|
-    ok = cmd_ltl(model, pan_bin, opts, prop, ltl_props)
-    ok ? total_pass += 1 : total_fail += 1
+    counts[cmd_ltl(model, pan_bin, opts, prop, ltl_props)] += 1
     cleanup(SCRIPT_DIR, pan_bin)
   end
 
   puts ''
   banner('SUITE COMPLETE')
-  puts "  #{Color.green("#{total_pass} passed")}, " \
-       "#{total_fail > 0 ? Color.red("#{total_fail} failed") : "#{total_fail} failed"} " \
-       "(#{total_pass + total_fail} total)"
-  total_fail == 0
+  puts summary_line(counts)
+  overall_status(counts)
 end
 
 def cmd_list_props(ltl_props)
@@ -533,7 +577,7 @@ def parse_options(argv) # rubocop:disable Metrics/MethodLength, Metrics/AbcSize
           #{prog} [options] <command> [args...]
 
       #{Color.bold('COMMANDS')}
-          #{Color.cyan('safety')}                Check assertions and deadlock freedom
+          #{Color.cyan('safety')}                Check assertions without never claims (end states with --check-end-states)
           #{Color.cyan('liveness')} [props...]   Verify LTL properties (default: all)
           #{Color.cyan('ltl')} <property>        Verify a single named LTL property
           #{Color.cyan('non-progress')}          Detect non-progress cycles (-DNP, -l)
@@ -577,7 +621,7 @@ def parse_options(argv) # rubocop:disable Metrics/MethodLength, Metrics/AbcSize
     o.on('--bitstate',
          'Supertrace/bitstate hashing — huge models, lossy') { opts[:compress] = :bitstate }
     o.on('--hash-compact [BITS]', Integer,
-         'Hash compaction: 0-4 selects HC0..HC4; omit for HC [lossless]') do |v|
+         'Hash compaction: 0-4 selects HC0..HC4; omit for HC [approximate]') do |v|
       opts[:compress] = v ? :"hc#{v}" : :hc
     end
     o.on('--collapse',
@@ -770,7 +814,7 @@ def print_examples(prog)
       #{prog} safety --bitstate                # supertrace — fast, approximate
       #{prog} safety --bitstate --hash-seed 1  # vary hash seed for extra coverage
       #{prog} safety --bitstate --hash-seed 2  # each seed explores differently
-      #{prog} safety --hash-compact            # lossless HC (≈50% memory saving)
+      #{prog} safety --hash-compact            # approximate HC (≈50% memory saving)
       #{prog} safety --hash-compact 4          # HC4 variant (more bits, more reliable)
       #{prog} safety --collapse                # collapse compression (lossless)
       #{prog} safety --ma 200                  # minimized automaton (exact, small models)
@@ -837,12 +881,16 @@ def print_examples(prog)
 
       Strategy         Flag              Memory   Completeness
       ─────────────────────────────────────────────────────────────
-      Exhaustive       (default)         high     complete (100%)
+      Exhaustive       (default)         high     complete if it finishes
       Bitstate         --bitstate        low      approximate (may miss errors)
-      Hash-compact     --hash-compact    medium   lossless (complete)
-      Hash-compact N   --hash-compact N  medium   lossless (N=0..4, more bits)
-      Collapse         --collapse        medium   lossless (complete)
+      Hash-compact     --hash-compact    medium   approximate (rarely misses states)
+      Hash-compact N   --hash-compact N  medium   approximate (N=0..4, more bits)
+      Collapse         --collapse        medium   lossless (complete if it finishes)
       Min. automaton   --ma N            lowest   exact (needs N-byte bound)
+
+      Whatever the strategy, a search stopped by --memlim, --depth or --timeout
+      is reported as INCOMPLETE: its "errors: 0" only covers the explored part.
+      Approximate strategies are also reported as INCOMPLETE.
 
     #{Color.bold('PARTIAL ORDER REDUCTION (POR)')}
 
@@ -907,14 +955,14 @@ def main
 
   Dir.chdir(SCRIPT_DIR)
 
-  ok = true
+  status = :pass
   begin
     case command
     when 'safety'
-      ok = cmd_safety(model, pan, opts)
+      status = cmd_safety(model, pan, opts)
     when 'liveness'
       props = args.empty? ? ltl_props.keys : args
-      ok = cmd_liveness(model, pan, opts, props, ltl_props)
+      status = cmd_liveness(model, pan, opts, props, ltl_props)
     when 'ltl'
       prop = args.shift
       unless prop
@@ -922,15 +970,15 @@ def main
         cmd_list_props(ltl_props)
         exit 1
       end
-      ok = cmd_ltl(model, pan, opts, prop, ltl_props)
+      status = cmd_ltl(model, pan, opts, prop, ltl_props)
     when 'non-progress'
-      ok = cmd_non_progress(model, pan, opts)
+      status = cmd_non_progress(model, pan, opts)
     when 'sim'
       cmd_sim(model, opts)
     when 'trail'
       cmd_trail(model, opts)
     when 'all'
-      ok = cmd_all(model, pan, opts, ltl_props)
+      status = cmd_all(model, pan, opts, ltl_props)
     when 'list-props'
       cmd_list_props(ltl_props)
     else
@@ -942,7 +990,8 @@ def main
     cleanup(SCRIPT_DIR, pan) unless opts[:keep]
   end
 
-  exit(ok ? 0 : 1)
+  # 0: every search PASS; 1: some FAIL; 2: some INCOMPLETE and none FAIL
+  exit({ pass: 0, fail: 1, incomplete: 2 }.fetch(status, 1))
 end
 
 main

@@ -19,6 +19,14 @@
 #   ./verify_full.sh ltl --collapse --mem 16384
 #   ./verify_full.sh safety --mem 8192
 #   ./verify_full.sh all --collapse -q
+#
+# Each search is reported as PASS (full state space explored, no errors), FAIL
+# (errors found) or INCOMPLETE (stopped by the memory bound, the depth bound or
+# an interruption; "errors: 0" then only covers the explored part). pan exits
+# with status 0 in all three cases, so the status is read from its output.
+#
+# Exit status: 0 if every search is PASS, 1 if any is FAIL, 2 if some are
+# INCOMPLETE and none FAIL.
 
 set -euo pipefail
 
@@ -114,17 +122,18 @@ print_stats() {
     local depth=$(grep -oP 'depth reached \K[0-9]+' "$file" || echo "0")
     local memory=$(grep "total actual memory usage" "$file" | awk '{print $1}' || echo "0")
     local time=$(grep -oP 'elapsed time \K[0-9.]+' "$file" || echo "0")
-    local errors=$(grep -oP 'errors: \K[0-9]+' "$file" || echo "1")
-    local incomplete=$(grep -c "Search not completed" "$file" || true)
+    local errors=$(grep -oP 'errors: \K[0-9]+' "$file" | tail -n 1 || true)
+    local incomplete=$(grep -c -E "Search not completed|reached -DMEMLIM bound|max search depth too small|^Interrupted" "$file" || true)
 
     local status="${GREEN}PASS${NC}"
     local rc=0
-    if [[ "$errors" != "0" || $exit_code -ne 0 ]]; then
+    if [[ -n "$errors" && "$errors" != "0" ]]; then
         status="${RED}FAIL${NC}"
         rc=1
-    elif [[ "$incomplete" -gt 0 ]]; then
+    elif [[ -z "$errors" || "$incomplete" -gt 0 || $exit_code -ne 0 ]]; then
+        # No final report, a bound reached or an interruption: the search did not finish.
         status="${BLUE}INCOMPLETE${NC}"
-        rc=0
+        rc=2
     fi
 
     printf "%-45s | ${status} | %10s st | %6s dp | %7s MB | %5s s\n" "$label" "$states" "$depth" "$memory" "$time"
@@ -136,17 +145,27 @@ print_header() {
     echo "----------------------------------------------------------------------------------------------------"
 }
 
-# 1. Safety Check (if mode is safety or all)
+# Count FAIL (status 1) and INCOMPLETE (status 2) searches
 FAILED_COUNT=0
+INCOMPLETE_COUNT=0
+tally() {
+    case "$1" in
+        1) FAILED_COUNT=$((FAILED_COUNT + 1)) ;;
+        2) INCOMPLETE_COUNT=$((INCOMPLETE_COUNT + 1)) ;;
+    esac
+}
+
+# 1. Safety Check (if mode is safety or all)
 if [[ "$MODE" == "safety" || "$MODE" == "all" ]]; then
     echo -n "Compiling safety verifier... "
-    if spin -a "$MODEL" && cc $CC_FLAGS -DSAFETY -o "$PAN" pan.c 2>>"$LOG"; then
+    # -DNOCLAIM: check the assertions on their own; otherwise pan would run them
+    # inside the first LTL claim of the model.
+    if spin -a "$MODEL" && cc $CC_FLAGS -DSAFETY -DNOCLAIM -o "$PAN" pan.c 2>>"$LOG"; then
         echo -e "${GREEN}DONE${NC}"
         print_header
         run_pan "$LOG" -m$MAX_DEPTH -n -E && pan_rc=0 || pan_rc=$?
-        if ! print_stats "Safety (Assertions/Deadlocks)" "$LOG" $pan_rc; then
-            FAILED_COUNT=$((FAILED_COUNT + 1))
-        fi
+        print_stats "Safety (assertions, no claim)" "$LOG" $pan_rc && st=0 || st=$?
+        tally $st
         echo "----------------------------------------------------------------------------------------------------"
     else
         echo -e "${RED}FAILED${NC} (check $LOG)"
@@ -165,24 +184,13 @@ if [[ "$MODE" == "ltl" || "$MODE" == "all" ]]; then
             print_header
         fi
 
-        PROPS=(
-            "every_requested_key_eventually_materializes"
-            "no_starvation_thread0"
-            "no_starvation_thread1"
-            "no_starvation_thread2"
-            "no_starvation_thread3"
-            "no_starvation_thread4"
-            "no_starvation_thread5"
-            "all_terminate"
-            "no_orphaned_computing"
-            "saturation_transient"
-        )
+        # Every ltl block declared in the model
+        mapfile -t PROPS < <(sed -n 's/^[[:space:]]*ltl[[:space:]]\{1,\}\([A-Za-z_][A-Za-z0-9_]*\).*/\1/p' "$MODEL")
 
         for prop in "${PROPS[@]}"; do
             run_pan "$LOG" -m$MAX_DEPTH -n -E -a -f -N "$prop" && pan_rc=0 || pan_rc=$?
-            if ! print_stats "LTL: $prop" "$LOG" $pan_rc; then
-                FAILED_COUNT=$((FAILED_COUNT + 1))
-            fi
+            print_stats "LTL: $prop" "$LOG" $pan_rc && st=0 || st=$?
+            tally $st
         done
         echo "----------------------------------------------------------------------------------------------------"
     else
@@ -191,12 +199,19 @@ if [[ "$MODE" == "ltl" || "$MODE" == "all" ]]; then
     fi
 fi
 
-if [ $FAILED_COUNT -eq 0 ]; then
-    echo -e "${GREEN}${BOLD}VERDICT: MODEL IS CORRECT${NC}"
-else
-    echo -e "${RED}${BOLD}VERDICT: MODEL HAS $FAILED_COUNT FAILURES${NC}"
+if [ $FAILED_COUNT -gt 0 ]; then
+    echo -e "${RED}${BOLD}VERDICT: FAIL ($FAILED_COUNT searches found errors)${NC}"
     echo -e "Check $LOG for details or run 'spin -t -p $MODEL' for replay."
+    VERDICT_RC=1
+elif [ $INCOMPLETE_COUNT -gt 0 ]; then
+    echo -e "${BLUE}${BOLD}VERDICT: INCOMPLETE ($INCOMPLETE_COUNT searches stopped before exhausting the state space)${NC}"
+    echo -e "Their \"errors: 0\" only covers the explored part. Raise --mem, use --collapse or reduce the model bounds."
+    VERDICT_RC=2
+else
+    echo -e "${GREEN}${BOLD}VERDICT: PASS (every search explored the full state space of the bounded model without errors)${NC}"
+    VERDICT_RC=0
 fi
 
 # Cleanup
 rm -f pan.* "$PAN" _spin_nvr.tmp
+exit $VERDICT_RC

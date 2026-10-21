@@ -88,7 +88,7 @@ cache.stats();              // hits, misses, negative_hits, evictions
 
 ## Concurrency Model
 
-Follows the same proven model as [gateway_cache](https://github.com/lrleon/gateway_cache) (6 years in production):
+Follows the same proven model as [gateway_cache](https://github.com/lrleon/gateway_cache) (in production for more than five years):
 
 1. **Global mutex** protects the hash table and LRU list (short critical sections)
 2. **Per-entry mutex + condition_variable** implements single-flight:
